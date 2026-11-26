@@ -1,0 +1,19 @@
+{
+  "name": "shadowtunnel-proxy",
+  "version": "1.0.0",
+  "description": "Zero-dependency multi-hop HTTP/HTTPS proxy (Onion & Point-to-Point modes) built on ShadowTunnel",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "./onion.mjs",
+  "exports": {
+    ".": "./onion.mjs",
+    "./tunnel": "./tunnel.mjs",
+    "./crypto": "./crypto.mjs"
+  },
+  "bin": {
+    "shadowtunnel-proxy": "./cli.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

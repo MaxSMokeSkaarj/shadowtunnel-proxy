@@ -155,3 +155,10 @@ vite.config.ts.timestamp-*
 .nx/cache
 .nx/workspace-data
 .nx/migrate-runs
+
+# ShadowTunnel keys & unix sockets
+*.key
+*.pub
+*.sock
+keys/
+authorized_keys
