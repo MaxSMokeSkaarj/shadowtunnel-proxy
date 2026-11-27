@@ -55,11 +55,29 @@ import {
   createTransportServer,
   dialTransport,
   formatEndpoint,
+  loadJsonConfig,
   parseEndpoint,
+  parseJsonc,
   prepareUnixSocketPath,
+  resolveEndpointFromConfig,
+  resolveKeySpecFromConfig,
+  resolvePathFromConfig,
+  stripJsonc,
 } from './transport.mjs';
 
-export { dialTransport, formatEndpoint, parseEndpoint, prepareUnixSocketPath, WebSocketStream };
+export {
+  WebSocketStream,
+  dialTransport,
+  formatEndpoint,
+  loadJsonConfig,
+  parseEndpoint,
+  parseJsonc,
+  prepareUnixSocketPath,
+  resolveEndpointFromConfig,
+  resolveKeySpecFromConfig,
+  resolvePathFromConfig,
+  stripJsonc,
+};
 
 const STATE_CLIENT_INIT = 'CLIENT_INIT';
 const STATE_WAIT_CLIENT_HELLO = 'WAIT_CLIENT_HELLO';

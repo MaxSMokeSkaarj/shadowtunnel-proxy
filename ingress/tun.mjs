@@ -50,6 +50,134 @@ export function parseIpv4Cidr(cidrStr) {
   };
 }
 
+export function normalizeIpv4RouteCidr(cidrOrIp) {
+  const [ipPart, prefixPart] = String(cidrOrIp).trim().split('/');
+  const prefixLen = prefixPart !== undefined ? Number(prefixPart) : 32;
+  if (!Number.isInteger(prefixLen) || prefixLen < 0 || prefixLen > 32) {
+    throw new Error(`Invalid route prefix "/${prefixPart}" in "${cidrOrIp}" (expected /0../32)`);
+  }
+  const ipUint32 = ipv4ToUint32(ipPart);
+  const maskUint32 = prefixLen === 0 ? 0 : ((0xffffffff << (32 - prefixLen)) >>> 0);
+  const networkUint32 = (ipUint32 & maskUint32) >>> 0;
+  return `${uint32ToIpv4(networkUint32)}/${prefixLen}`;
+}
+
+function expandRouteSpecTokens(specs = []) {
+  const list = Array.isArray(specs) ? specs : [specs];
+  const tokens = [];
+
+  for (const rawItem of list) {
+    const item = String(rawItem || '').trim();
+    if (!item) continue;
+
+    const looksLikePath = item.startsWith('/') || item.startsWith('./') || item.startsWith('../');
+    if (fs.existsSync(item) && fs.statSync(item).isFile()) {
+      const lines = fs.readFileSync(item, 'utf8').split(/\r?\n/);
+      for (const rawLine of lines) {
+        const cleanLine = rawLine.replace(/#.*$/, '').trim();
+        if (!cleanLine) continue;
+        for (const part of cleanLine.split(/[\s,]+/)) {
+          if (part) tokens.push(part);
+        }
+      }
+      continue;
+    }
+
+    if (looksLikePath) {
+      throw new Error(`TUN route list file not found: ${item}`);
+    }
+
+    for (const part of item.split(',')) {
+      const clean = part.replace(/#.*$/, '').trim();
+      if (clean) tokens.push(clean);
+    }
+  }
+
+  return tokens;
+}
+
+function sanitizeDomainToken(token) {
+  let clean = token.trim();
+  clean = clean.replace(/^[a-zA-Z]+:\/\//, '');
+  const slashIdx = clean.indexOf('/');
+  if (slashIdx !== -1) clean = clean.slice(0, slashIdx);
+  const colonIdx = clean.indexOf(':');
+  if (colonIdx !== -1) clean = clean.slice(0, colonIdx);
+  return clean.toLowerCase();
+}
+
+export async function resolveTunRouteTargets(specs = [], options = {}) {
+  const { resolveDomain = null } = options;
+  const tokens = expandRouteSpecTokens(specs);
+  const cidrs = new Set();
+
+  for (const token of tokens) {
+    // Skip IPv6 literals or IPv6 CIDRs gracefully without failing mixed lists
+    if (token.includes(':') && !/^[a-zA-Z]+:\/\//.test(token)) {
+      continue;
+    }
+
+    if (token.includes('/') && !/^[a-zA-Z]+:\/\//.test(token)) {
+      const [ipCandidate] = token.split('/');
+      if (net.isIP(ipCandidate) === 4) {
+        cidrs.add(normalizeIpv4RouteCidr(token));
+        continue;
+      }
+    }
+
+    if (net.isIP(token) === 4) {
+      cidrs.add(`${token}/32`);
+      continue;
+    }
+
+    const domain = sanitizeDomainToken(token);
+    if (!domain) continue;
+
+    if (net.isIP(domain) === 4) {
+      cidrs.add(`${domain}/32`);
+      continue;
+    }
+
+    const ipv4Addrs = new Set();
+    if (typeof resolveDomain === 'function') {
+      const records = await resolveDomain(domain);
+      for (const rec of records || []) {
+        const addr = typeof rec === 'string' ? rec : rec?.address;
+        if (addr && net.isIP(addr) === 4) ipv4Addrs.add(addr);
+      }
+    } else {
+      // 1) Query DNS A RRset directly to capture all IPv4 records (e.g. all 4 A records on dual-stack hosts)
+      try {
+        const aRecords = await dns.promises.resolve4(domain);
+        for (const ip of aRecords) {
+          if (net.isIP(ip) === 4) ipv4Addrs.add(ip);
+        }
+      } catch {
+        // Fall through to OS getaddrinfo lookup (handles /etc/hosts and local search domains)
+      }
+      // 2) Also consult OS resolver({ all: true }) and filter strictly to IPv4 (ignoring AAAA IPv6)
+      if (ipv4Addrs.size === 0) {
+        try {
+          const allRecords = await dns.promises.lookup(domain, { all: true });
+          for (const rec of allRecords) {
+            if (rec.family === 4 && net.isIP(rec.address) === 4) {
+              ipv4Addrs.add(rec.address);
+            }
+          }
+        } catch {
+          // Unresolvable or IPv6-only domain: skip without crashing tunnel startup
+        }
+      }
+    }
+
+    for (const ip of ipv4Addrs) {
+      cidrs.add(`${ip}/32`);
+    }
+  }
+
+  return Array.from(cidrs);
+}
+
 function attachTunFdViaSystemIoctl(fd, requestedIfname) {
   if (!/^[a-zA-Z0-9_.-]{0,15}$/.test(requestedIfname)) {
     throw new Error(`Invalid TUN interface name "${requestedIfname}" (max 15 safe chars)`);
@@ -411,38 +539,109 @@ export function createExitTunGateway(options = {}) {
   };
 }
 
-async function installClientDefaultRoute(tunName, gatewayIp, entryEndpoint) {
-  const ep = parseEndpoint(entryEndpoint, '');
-  if (!ep.host) return () => {};
-  const resolved = net.isIP(ep.host) ? { address: ep.host } : await dns.promises.lookup(ep.host, { family: 4 });
-  const entryIp = resolved.address;
+const TUN_ROUTE_PROTO = '199';
 
-  const cleanup = [];
-  if (!entryIp.startsWith('127.')) {
-    const routeOut = execFileSync('ip', ['-4', 'route', 'get', entryIp]).toString('utf8');
-    const viaMatch = routeOut.match(/\bvia\s+(\S+)/);
-    const devMatch = routeOut.match(/\bdev\s+(\S+)/);
-    if (devMatch && devMatch[1] !== tunName) {
-      const args = ['route', 'replace', `${entryIp}/32`];
-      if (viaMatch) args.push('via', viaMatch[1]);
-      args.push('dev', devMatch[1]);
-      execFileSync('ip', args);
-      cleanup.push(() => {
-        spawnSync('ip', ['route', 'del', `${entryIp}/32`], { stdio: 'ignore' });
-      });
+function detectPhysicalGateway(probeIp, tunName) {
+  if (probeIp && !probeIp.startsWith('127.')) {
+    try {
+      const routeOut = execFileSync('ip', ['-4', 'route', 'get', probeIp]).toString('utf8');
+      const viaMatch = routeOut.match(/\bvia\s+(\S+)/);
+      const devMatch = routeOut.match(/\bdev\s+(\S+)/);
+      if (devMatch && devMatch[1] !== tunName) {
+        return { via: viaMatch ? viaMatch[1] : null, dev: devMatch[1] };
+      }
+    } catch {}
+  }
+
+  try {
+    const defOut = execFileSync('ip', ['-4', 'route', 'show', 'default']).toString('utf8');
+    for (const line of defOut.split(/\r?\n/)) {
+      const devMatch = line.match(/\bdev\s+(\S+)/);
+      if (devMatch && devMatch[1] !== tunName) {
+        const viaMatch = line.match(/\bvia\s+(\S+)/);
+        return { via: viaMatch ? viaMatch[1] : null, dev: devMatch[1] };
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
+function runIpBatch(lines) {
+  if (lines.length === 0) return;
+  const res = spawnSync('ip', ['-4', '-batch', '-'], {
+    input: `${lines.join('\n')}\n`,
+    stdio: ['pipe', 'ignore', 'pipe'],
+  });
+  if (res.status !== 0) {
+    const errText = (res.stderr ? res.stderr.toString('utf8') : '').trim();
+    throw new Error(`ip -batch route update failed: ${errText || `exit ${res.status}`}`);
+  }
+}
+
+async function installClientTunRoutes({
+  tunName,
+  gatewayIp,
+  entryEndpoint,
+  defaultRoute = false,
+  excludeCidrs = [],
+  includeCidrs = [],
+}) {
+  let entryIp = null;
+  if (entryEndpoint) {
+    const ep = parseEndpoint(entryEndpoint, '');
+    if (ep.host) {
+      const resolved = net.isIP(ep.host) === 4
+        ? { address: ep.host }
+        : await dns.promises.lookup(ep.host, { family: 4 }).catch(() => null);
+      if (resolved?.address) entryIp = resolved.address;
     }
   }
 
-  execFileSync('ip', ['route', 'replace', '0.0.0.0/1', 'via', gatewayIp, 'dev', tunName]);
-  execFileSync('ip', ['route', 'replace', '128.0.0.0/1', 'via', gatewayIp, 'dev', tunName]);
-  cleanup.push(() => {
-    spawnSync('ip', ['route', 'del', '0.0.0.0/1', 'dev', tunName], { stdio: 'ignore' });
-    spawnSync('ip', ['route', 'del', '128.0.0.0/1', 'dev', tunName], { stdio: 'ignore' });
-  });
+  const phys = (defaultRoute || excludeCidrs.length > 0)
+    ? detectPhysicalGateway(entryIp || excludeCidrs[0]?.split('/')[0], tunName)
+    : null;
+
+  const addBatch = [];
+  const delBatch = [];
+
+  const addPhysicalBypass = (cidr) => {
+    if (!phys) return;
+    const viaClause = phys.via ? `via ${phys.via} ` : '';
+    addBatch.push(`route replace ${cidr} ${viaClause}dev ${phys.dev} proto ${TUN_ROUTE_PROTO}`);
+    delBatch.push(`route del ${cidr} ${viaClause}dev ${phys.dev} proto ${TUN_ROUTE_PROTO}`);
+  };
+
+  if (defaultRoute && entryIp && !entryIp.startsWith('127.')) {
+    addPhysicalBypass(`${entryIp}/32`);
+  }
+
+  for (const cidr of excludeCidrs) {
+    if (defaultRoute && entryIp && cidr === `${entryIp}/32`) continue;
+    addPhysicalBypass(cidr);
+  }
+
+  if (defaultRoute && gatewayIp) {
+    addBatch.push(`route replace 0.0.0.0/1 via ${gatewayIp} dev ${tunName} proto ${TUN_ROUTE_PROTO}`);
+    addBatch.push(`route replace 128.0.0.0/1 via ${gatewayIp} dev ${tunName} proto ${TUN_ROUTE_PROTO}`);
+    delBatch.push(`route del 0.0.0.0/1 dev ${tunName} proto ${TUN_ROUTE_PROTO}`);
+    delBatch.push(`route del 128.0.0.0/1 dev ${tunName} proto ${TUN_ROUTE_PROTO}`);
+  }
+
+  if (gatewayIp) {
+    for (const cidr of includeCidrs) {
+      addBatch.push(`route replace ${cidr} via ${gatewayIp} dev ${tunName} proto ${TUN_ROUTE_PROTO}`);
+      delBatch.push(`route del ${cidr} dev ${tunName} proto ${TUN_ROUTE_PROTO}`);
+    }
+  }
+
+  runIpBatch(addBatch);
 
   return () => {
-    for (const fn of cleanup.reverse()) {
-      try { fn(); } catch {}
+    if (delBatch.length === 0) return;
+    // Best-effort per-line batch removal on shutdown (ignores routes already vanished with tunName)
+    for (const cmd of delBatch.reverse()) {
+      spawnSync('ip', ['-4', ...cmd.split(/\s+/)], { stdio: 'ignore' });
     }
   };
 }
@@ -454,6 +653,8 @@ export async function createLocalTun(options = {}) {
     mtu = null,
     configure = true,
     defaultRoute = false,
+    routes = [],
+    exclude = [],
     key,
     mode = 'onion',
     pool = null,
@@ -470,6 +671,14 @@ export async function createLocalTun(options = {}) {
   } = options;
 
   getMode(mode);
+
+  // Resolve exclude & include targets BEFORE altering system routes so local DNS resolves cleanly
+  const excludeCidrs = exclude && (Array.isArray(exclude) ? exclude.length > 0 : Boolean(exclude))
+    ? await resolveTunRouteTargets(exclude)
+    : [];
+  const includeCidrs = routes && (Array.isArray(routes) ? routes.length > 0 : Boolean(routes))
+    ? await resolveTunRouteTargets(routes)
+    : [];
 
   let requestedIp = null;
   let staticPrefixLen = null;
@@ -547,9 +756,16 @@ export async function createLocalTun(options = {}) {
     if (configure) {
       tun.configure({ ip: assignedIp, prefixLen, mtu: effectiveMtu });
     }
-    if (defaultRoute && !configuredOnce && gatewayIp) {
+    if (configure && !configuredOnce && (defaultRoute || excludeCidrs.length > 0 || includeCidrs.length > 0)) {
       const entryEp = hops.length > 0 ? hops[0].endpoint : exit.endpoint;
-      cleanupRoutes = await installClientDefaultRoute(tun.name, gatewayIp, entryEp);
+      cleanupRoutes = await installClientTunRoutes({
+        tunName: tun.name,
+        gatewayIp,
+        entryEndpoint: entryEp,
+        defaultRoute,
+        excludeCidrs,
+        includeCidrs,
+      });
     }
     configuredOnce = true;
 

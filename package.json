@@ -1,6 +1,6 @@
 {
   "name": "shadowtunnel-proxy",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Zero-dependency modular multi-hop HTTP, SOCKS5 (+UDP) & Linux TUN proxy/VPN (Onion & PTP + Stream Mux + TLS/WSS Camouflage)",
   "license": "AGPL-3.0-only",
   "contributors": [
@@ -13,6 +13,7 @@
   "main": "./index.mjs",
   "exports": {
     ".": "./index.mjs",
+    "./config": "./config.mjs",
     "./modes": "./modes/index.mjs",
     "./modes/onion": "./modes/onion.mjs",
     "./modes/ptp": "./modes/ptp.mjs",

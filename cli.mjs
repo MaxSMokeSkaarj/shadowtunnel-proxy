@@ -11,11 +11,15 @@ import {
   createLocalSocks5Proxy,
   createLocalTun,
   createRelayServer,
+  extractConfigFlag,
   listModes,
+  loadProxyRoleConfig,
+  parseHopEntry,
 } from './index.mjs';
 
 const HELP = `Usage:
   node cli.mjs <role> [options]
+  node cli.mjs -c <config.json> [cli-overrides]
 
 Roles:
   keygen   Generate an Ed25519 identity keypair (<out>.key + <out>.pub)
@@ -27,6 +31,10 @@ Modes:
   onion    Nested E2EE matryoshka (Client <-> Exit encrypted end-to-end; relays are blind)
   ptp      Point-to-Point hop-by-hop encryption (1 cipher layer per segment; neighbor auth)
   both     (Relay/Exit default) Accept both onion and dynamic ptp circuits on the same port
+
+Options (common):
+  -c, --config <file>      Load settings from JSON / JSONC file (CLI flags override config!)
+  -q, --quiet              Suppress informational logs
 
 Options (keygen):
   -o, --out <prefix>       Output path prefix (<prefix>.key and <prefix>.pub)
@@ -43,7 +51,6 @@ Options (relay):
       --tls-cert <file>    TLS certificate PEM (for tls:// or wss:// listener)
       --tls-key <file>     TLS private key PEM (for tls:// or wss:// listener)
       --fallback <ep>      Decoy HTTP backend (host:port) for browsers / DPI active probes
-  -q, --quiet              Suppress informational logs
 
 Options (exit):
   -m, --mode <mode>        Exit mode label: onion | ptp | both (default: both)
@@ -60,7 +67,6 @@ Options (exit):
       --tls-cert <file>    TLS certificate PEM (for tls:// or wss:// listener)
       --tls-key <file>     TLS private key PEM (for tls:// or wss:// listener)
       --fallback <ep>      Decoy HTTP backend (host:port) for browsers / DPI active probes
-  -q, --quiet              Suppress informational logs
 
 Options (client):
   -m, --mode <mode>        Circuit mode: onion | ptp (default: onion)
@@ -71,6 +77,8 @@ Options (client):
       --tun-cidr <cidr>    Request a specific client TUN IP/prefix (e.g. 10.99.0.2/24)
       --tun-mtu <bytes>    Override local TUN MTU (default: negotiated from exit)
       --tun-default-route  Route system IPv4 traffic (0.0.0.0/1 + 128.0.0.0/1) via TUN
+      --tun-exclude <spec> Bypass TUN via physical gateway (IP, CIDR, domain, or file; repeatable)
+      --tun-route <spec>   Route specific target via TUN (IP, CIDR, domain, or file; repeatable)
       --no-tun-config      Skip ip addr/link setup (use pre-configured rootless TUN)
   -k, --key <file>         Client private key (.key)
       --hop <ep>,<pub>     Intermediate relay (supports tcp, tls://, ws://, wss://host:443/path)
@@ -80,36 +88,21 @@ Options (client):
       --tls-ca <file>      Custom CA PEM for verifying entry TLS certificate
       --tls-sni <domain>   Override TLS SNI hostname on entry connection
       --tls-insecure       Skip X.509 check (Ed25519 tunnel key check still enforced!)
-  -q, --quiet              Suppress informational logs
 
 Examples:
-  # A) HTTP + SOCKS5 (TCP & UDP) simultaneously over persistent multi-hop circuits:
-  node cli.mjs client -m ptp -l 127.0.0.1:8080 -s 127.0.0.1:1080 -k ./keys/client.key \\
-    --hop wss://relay1.example.com:443/v1/sync,./keys/r1.pub \\
-    --exit 203.0.113.9:5001,./keys/exit.pub
+  # 1) Start from JSON / JSONC config file (with optional CLI override):
+  node cli.mjs -c ./client.json
+  node cli.mjs -c ./client.json -m onion
 
-  # B) Full-system Linux L3 TUN VPN (ICMP, TCP, UDP, QUIC):
-  sudo node cli.mjs exit   -l :5001 -k ./keys/exit.key -a ./keys/client.pub --tun st0 --nat
-  sudo node cli.mjs client -k ./keys/client.key -e 203.0.113.9:5001,./keys/exit.pub \\
-    --no-http --tun st0 --tun-default-route
+  # 2) Direct CLI launch (HTTP + SOCKS5+UDP):
+  node cli.mjs client -m ptp -l 127.0.0.1:8080 -s 127.0.0.1:1080 -k ./keys/client.key \\
+    --hop wss://relay1.example.com:443/ws/example-path,./keys/r1.pub \\
+    --exit 203.0.113.9:5001,./keys/exit.pub
 `;
 
 function die(msg) {
   console.error(`Error: ${msg}`);
   process.exit(1);
-}
-
-function parseHopSpec(spec, flagName) {
-  const commaIdx = spec.indexOf(',');
-  if (commaIdx === -1) {
-    die(`Invalid ${flagName} "${spec}" (expected "<host:port>,<pubkey-file>")`);
-  }
-  const endpoint = spec.slice(0, commaIdx).trim();
-  const publicKey = spec.slice(commaIdx + 1).trim();
-  if (!endpoint || !publicKey) {
-    die(`Invalid ${flagName} "${spec}" (expected "<host:port>,<pubkey-file>")`);
-  }
-  return { endpoint, publicKey };
 }
 
 function runKeygen(argv) {
@@ -152,20 +145,21 @@ function runKeygen(argv) {
   console.log(id.publicKeyLine);
 }
 
-function runRelay(argv) {
+function runRelay(argv, preloadedCfg = null) {
   const { values } = parseArgs({
     args: argv,
     options: {
+      config: { type: 'string', short: 'c' },
       mode: { type: 'string', short: 'm' },
       listen: { type: 'string', short: 'l' },
       key: { type: 'string', short: 'k' },
       auth: { type: 'string', short: 'a' },
-      open: { type: 'boolean', default: false },
+      open: { type: 'boolean' },
       next: { type: 'string' },
       'tls-cert': { type: 'string' },
       'tls-key': { type: 'string' },
       fallback: { type: 'string' },
-      quiet: { type: 'boolean', short: 'q', default: false },
+      quiet: { type: 'boolean', short: 'q' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     strict: true,
@@ -175,25 +169,36 @@ function runRelay(argv) {
     console.log(HELP);
     return;
   }
-  if (!values.listen || !values.key) die('relay requires -l <endpoint> and -k <relay.key>');
-  if (!values.auth && !values.open) die('relay requires either -a <authorized_keys> or --open');
 
-  const nextHop = values.next ? parseHopSpec(values.next, '--next') : null;
-  const effectiveMode = values.mode || (nextHop ? 'ptp' : 'both');
-  const log = (...a) => { if (!values.quiet) console.error(...a); };
+  const cfg = preloadedCfg || (values.config ? loadProxyRoleConfig(values.config) : {});
+  const listen = values.listen ?? cfg.listen;
+  const key = values.key ?? cfg.key;
+  const auth = values.auth ?? cfg.auth ?? null;
+  const allowOpen = values.open ?? cfg.open ?? false;
+  const nextHop = values.next ? parseHopEntry(values.next, null, '--next') : (cfg.next || null);
+  const effectiveMode = values.mode ?? cfg.mode ?? (nextHop ? 'ptp' : 'both');
+  const tlsCert = values['tls-cert'] ?? cfg.tlsCert;
+  const tlsKey = values['tls-key'] ?? cfg.tlsKey;
+  const fallback = values.fallback ?? cfg.fallback;
+  const quiet = values.quiet ?? cfg.quiet ?? false;
 
-  const listenEp = parseEndpoint(values.listen, '');
+  if (!listen || !key) die('relay requires -l <endpoint> and -k <relay.key>');
+  if (!auth && !allowOpen) die('relay requires either -a <authorized_keys> or --open');
+
+  const log = (...a) => { if (!quiet) console.error(...a); };
+
+  const listenEp = parseEndpoint(listen, '');
   const server = createRelayServer({
-    key: values.key,
+    key,
     mode: effectiveMode,
     nextHop,
-    authorizedKeys: values.auth || null,
-    allowAnyClient: Boolean(values.open),
+    authorizedKeys: auth,
+    allowAnyClient: Boolean(allowOpen),
     protocol: listenEp.protocol,
     wsPath: listenEp.wsPath,
-    tlsCert: values['tls-cert'],
-    tlsKey: values['tls-key'],
-    fallback: values.fallback,
+    tlsCert,
+    tlsKey,
+    fallback,
     onRelay: ({ mode, peerFingerprint, peerComment, nextEndpoint }) => {
       const who = peerComment ? `${peerComment} (${peerFingerprint})` : peerFingerprint;
       log(`[relay:${mode}] ${who} -> ${nextEndpoint}`);
@@ -201,7 +206,7 @@ function runRelay(argv) {
   });
 
   server.on('clientError', (err) => log(`[relay] Rejected peer: ${formatError(err)}`));
-  server.listen(values.listen, () => {
+  server.listen(listen, () => {
     const modeDesc = nextHop ? `ptp-static -> ${nextHop.endpoint}` : effectiveMode;
     log(`[relay] Listening on ${formatEndpoint(server.address())} | mode=${modeDesc} | ${server.fingerprint}`);
   });
@@ -211,25 +216,26 @@ function runRelay(argv) {
   process.on('SIGTERM', stop);
 }
 
-function runExit(argv) {
+function runExit(argv, preloadedCfg = null) {
   const { values } = parseArgs({
     args: argv,
     options: {
-      mode: { type: 'string', short: 'm', default: 'both' },
+      config: { type: 'string', short: 'c' },
+      mode: { type: 'string', short: 'm' },
       listen: { type: 'string', short: 'l' },
       key: { type: 'string', short: 'k' },
       auth: { type: 'string', short: 'a' },
-      open: { type: 'boolean', default: false },
-      'no-udp': { type: 'boolean', default: false },
+      open: { type: 'boolean' },
+      'no-udp': { type: 'boolean' },
       tun: { type: 'string' },
-      'tun-cidr': { type: 'string', default: '10.99.0.1/24' },
-      'tun-mtu': { type: 'string', default: '1400' },
-      nat: { type: 'boolean', default: false },
-      'no-tun-config': { type: 'boolean', default: false },
+      'tun-cidr': { type: 'string' },
+      'tun-mtu': { type: 'string' },
+      nat: { type: 'boolean' },
+      'no-tun-config': { type: 'boolean' },
       'tls-cert': { type: 'string' },
       'tls-key': { type: 'string' },
       fallback: { type: 'string' },
-      quiet: { type: 'boolean', short: 'q', default: false },
+      quiet: { type: 'boolean', short: 'q' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     strict: true,
@@ -239,39 +245,59 @@ function runExit(argv) {
     console.log(HELP);
     return;
   }
-  if (!values.listen || !values.key) die('exit requires -l <endpoint> and -k <exit.key>');
-  if (!values.auth && !values.open) die('exit requires either -a <authorized_keys> or --open');
+
+  const cfg = preloadedCfg || (values.config ? loadProxyRoleConfig(values.config) : {});
+  const mode = values.mode ?? cfg.mode ?? 'both';
+  const listen = values.listen ?? cfg.listen;
+  const key = values.key ?? cfg.key;
+  const auth = values.auth ?? cfg.auth ?? null;
+  const allowOpen = values.open ?? cfg.open ?? false;
+  const allowUdp = values['no-udp'] ? false : (cfg.udp ?? true);
+  const tlsCert = values['tls-cert'] ?? cfg.tlsCert;
+  const tlsKey = values['tls-key'] ?? cfg.tlsKey;
+  const fallback = values.fallback ?? cfg.fallback;
+  const quiet = values.quiet ?? cfg.quiet ?? false;
+
+  if (!listen || !key) die('exit requires -l <endpoint> and -k <exit.key>');
+  if (!auth && !allowOpen) die('exit requires either -a <authorized_keys> or --open');
   const validExitModes = [...listModes(), 'both', 'all'];
-  if (!validExitModes.includes(values.mode)) {
-    die(`Invalid exit --mode "${values.mode}" (expected ${validExitModes.join(', ')})`);
+  if (!validExitModes.includes(mode)) {
+    die(`Invalid exit --mode "${mode}" (expected ${validExitModes.join(', ')})`);
   }
 
-  const log = (...a) => { if (!values.quiet) console.error(...a); };
+  const log = (...a) => { if (!quiet) console.error(...a); };
 
+  const cfgTun = cfg.tun && cfg.tun.enabled !== false ? cfg.tun : null;
+  const tunName = values.tun ?? (cfgTun ? cfgTun.name : null);
   let tunGateway = null;
-  if (values.tun) {
+  if (tunName) {
+    const tunCidr = values['tun-cidr'] ?? cfgTun?.cidr ?? '10.99.0.1/24';
+    const tunMtu = Number(values['tun-mtu'] ?? cfgTun?.mtu ?? 1400) || 1400;
+    const tunConfigure = values['no-tun-config'] ? false : (cfgTun?.configure ?? true);
+    const tunNat = values.nat ?? cfgTun?.nat ?? false;
+
     tunGateway = createExitTunGateway({
-      ifname: values.tun,
-      cidr: values['tun-cidr'],
-      mtu: Number(values['tun-mtu']) || 1400,
-      configure: !values['no-tun-config'],
-      enableNat: Boolean(values.nat),
+      ifname: tunName,
+      cidr: tunCidr,
+      mtu: tunMtu,
+      configure: Boolean(tunConfigure),
+      enableNat: Boolean(tunNat),
     });
-    log(`[exit:tun] Interface ${tunGateway.name} ready (${tunGateway.gatewayIp}/${tunGateway.prefixLen}, mtu=${tunGateway.mtu}${values.nat ? ', nat=on' : ''})`);
+    log(`[exit:tun] Interface ${tunGateway.name} ready (${tunGateway.gatewayIp}/${tunGateway.prefixLen}, mtu=${tunGateway.mtu}${tunNat ? ', nat=on' : ''})`);
   }
 
-  const listenEp = parseEndpoint(values.listen, '');
+  const listenEp = parseEndpoint(listen, '');
   const server = createExitServer({
-    key: values.key,
-    authorizedKeys: values.auth || null,
-    allowAnyClient: Boolean(values.open),
-    allowUdp: !values['no-udp'],
+    key,
+    authorizedKeys: auth,
+    allowAnyClient: Boolean(allowOpen),
+    allowUdp,
     tunGateway,
     protocol: listenEp.protocol,
     wsPath: listenEp.wsPath,
-    tlsCert: values['tls-cert'],
-    tlsKey: values['tls-key'],
-    fallback: values.fallback,
+    tlsCert,
+    tlsKey,
+    fallback,
     onExitRequest: ({ mux, proto, streamId, peerFingerprint, peerComment, target }) => {
       const who = peerComment ? `${peerComment} (${peerFingerprint})` : peerFingerprint;
       const tag = mux ? `exit:${proto || 'mux'}#${streamId}` : 'exit';
@@ -280,8 +306,8 @@ function runExit(argv) {
   });
 
   server.on('clientError', (err) => log(`[exit] Rejected peer: ${formatError(err)}`));
-  server.listen(values.listen, () => {
-    log(`[exit] Listening on ${formatEndpoint(server.address())} | mode=${values.mode} | ${server.fingerprint}`);
+  server.listen(listen, () => {
+    log(`[exit] Listening on ${formatEndpoint(server.address())} | mode=${mode} | ${server.fingerprint}`);
   });
 
   const stop = () => server.close(() => process.exit(0));
@@ -289,28 +315,31 @@ function runExit(argv) {
   process.on('SIGTERM', stop);
 }
 
-async function runClient(argv) {
+async function runClient(argv, preloadedCfg = null) {
   const { values } = parseArgs({
     args: argv,
     options: {
-      mode: { type: 'string', short: 'm', default: 'onion' },
-      listen: { type: 'string', short: 'l', default: '127.0.0.1:8080' },
-      'no-http': { type: 'boolean', default: false },
+      config: { type: 'string', short: 'c' },
+      mode: { type: 'string', short: 'm' },
+      listen: { type: 'string', short: 'l' },
+      'no-http': { type: 'boolean' },
       socks: { type: 'string', short: 's' },
       tun: { type: 'string' },
       'tun-cidr': { type: 'string' },
       'tun-mtu': { type: 'string' },
-      'tun-default-route': { type: 'boolean', default: false },
-      'no-tun-config': { type: 'boolean', default: false },
+      'tun-default-route': { type: 'boolean' },
+      'tun-exclude': { type: 'string', multiple: true },
+      'tun-route': { type: 'string', multiple: true },
+      'no-tun-config': { type: 'boolean' },
       key: { type: 'string', short: 'k' },
-      hop: { type: 'string', multiple: true, default: [] },
+      hop: { type: 'string', multiple: true },
       exit: { type: 'string', short: 'e' },
-      pool: { type: 'string', default: '2' },
-      'no-mux': { type: 'boolean', default: false },
+      pool: { type: 'string' },
+      'no-mux': { type: 'boolean' },
       'tls-ca': { type: 'string' },
       'tls-sni': { type: 'string' },
-      'tls-insecure': { type: 'boolean', default: false },
-      quiet: { type: 'boolean', short: 'q', default: false },
+      'tls-insecure': { type: 'boolean' },
+      quiet: { type: 'boolean', short: 'q' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     strict: true,
@@ -320,37 +349,69 @@ async function runClient(argv) {
     console.log(HELP);
     return;
   }
-  if (!values.key || !values.exit) {
-    die('client requires -k <client.key> and --exit <endpoint>,<exit.pub>');
+
+  const hasConfig = Boolean(values.config || preloadedCfg);
+  const cfg = preloadedCfg || (values.config ? loadProxyRoleConfig(values.config) : {});
+
+  const mode = values.mode ?? cfg.mode ?? 'onion';
+  const key = values.key ?? cfg.key;
+  const hops = (values.hop && values.hop.length > 0)
+    ? values.hop.map((s) => parseHopEntry(s, null, '--hop'))
+    : (cfg.hops || []);
+  const exit = values.exit ? parseHopEntry(values.exit, null, '--exit') : cfg.exit;
+
+  if (!key || !exit) {
+    die('client requires -k <client.key> and --exit <endpoint>,<exit.pub> (or via -c config.json)');
   }
 
-  const enableHttp = !values['no-http'];
-  const enableSocks = Boolean(values.socks);
-  const enableTun = Boolean(values.tun);
+  const useMux = values['no-mux'] ? false : (cfg.mux ?? true);
+  const poolSize = Math.max(1, Number(values.pool ?? cfg.pool ?? 2) || 2);
+  const tlsCa = values['tls-ca'] ?? cfg.tlsCa;
+  const tlsServername = values['tls-sni'] ?? cfg.tlsSni;
+  const tlsInsecure = values['tls-insecure'] ?? cfg.tlsInsecure ?? false;
+  const quiet = values.quiet ?? cfg.quiet ?? false;
+
+  // Resolve SOCKS5 & TUN settings first so default HTTP behavior knows whether another ingress is active
+  const socksListen = values.socks ?? (cfg.socks !== false ? cfg.socks : null) ?? null;
+  const socksAuth = cfg.socksAuth || null;
+
+  const cfgTun = cfg.tun && cfg.tun.enabled !== false ? cfg.tun : null;
+  const tunName = values.tun ?? (cfgTun ? cfgTun.name : null);
+
+  let httpListen = null;
+  if (values['no-http']) {
+    httpListen = null;
+  } else if (values.listen) {
+    httpListen = values.listen;
+  } else if (cfg.http === false) {
+    httpListen = null;
+  } else if (typeof cfg.http === 'string') {
+    httpListen = cfg.http;
+  } else if (!hasConfig || (!socksListen && !tunName)) {
+    httpListen = '127.0.0.1:8080';
+  }
+
+  const enableHttp = Boolean(httpListen);
+  const enableSocks = Boolean(socksListen);
+  const enableTun = Boolean(tunName);
   if (!enableHttp && !enableSocks && !enableTun) {
-    die('No local ingress enabled: remove --no-http, or specify --socks <ep> and/or --tun <ifname>');
+    die('No local ingress enabled: enable http, socks, or tun in config / CLI flags');
   }
 
-  const log = (...a) => { if (!values.quiet) console.error(...a); };
-  const hops = values.hop.map((s) => parseHopSpec(s, '--hop'));
-  const exit = parseHopSpec(values.exit, '--exit');
+  const log = (...a) => { if (!quiet) console.error(...a); };
 
-  const useMux = !values['no-mux'];
-  const poolSize = Math.max(1, Number(values.pool) || 2);
-
-  // Share one persistent MuxCircuitPool across HTTP, SOCKS5 (+UDP), and TUN ingresses
   const sharedPool = (useMux || enableSocks || enableTun)
     ? new MuxCircuitPool({
-        key: values.key,
-        mode: values.mode,
+        key,
+        mode,
         hops,
         exit,
         poolSize,
-        tlsCa: values['tls-ca'],
-        tlsServername: values['tls-sni'],
-        tlsInsecure: values['tls-insecure'],
-        onSessionOpen: ({ slot, mode, hopCount }) => {
-          log(`[proxy-client:${mode}] Persistent mux circuit #${slot + 1} established (${hopCount} relays)`);
+        tlsCa,
+        tlsServername,
+        tlsInsecure,
+        onSessionOpen: ({ slot, mode: m, hopCount }) => {
+          log(`[proxy-client:${m}] Persistent mux circuit #${slot + 1} established (${hopCount} relays)`);
         },
       })
     : null;
@@ -359,66 +420,81 @@ async function runClient(argv) {
 
   if (enableHttp) {
     const httpProxy = createLocalHttpProxy({
-      key: values.key,
-      mode: values.mode,
+      key,
+      mode,
       mux: useMux,
       pool: useMux ? sharedPool : null,
       hops,
       exit,
-      tlsCa: values['tls-ca'],
-      tlsServername: values['tls-sni'],
-      tlsInsecure: values['tls-insecure'],
-      onRequest: ({ mode, mux, method, host, port, hopCount }) => {
-        log(`[proxy-client:${mode}${mux ? ':mux' : ''}] ${method} ${host}:${port} via ${hopCount} relay(s) + exit`);
+      tlsCa,
+      tlsServername,
+      tlsInsecure,
+      onRequest: ({ mode: m, mux, method, host, port, hopCount }) => {
+        log(`[proxy-client:${m}${mux ? ':mux' : ''}] ${method} ${host}:${port} via ${hopCount} relay(s) + exit`);
       },
       onError: (err) => log(`[proxy-client:http] Circuit error: ${formatError(err)}`),
     });
 
-    httpProxy.listen(values.listen, () => {
+    httpProxy.listen(httpListen, () => {
       const muxInfo = useMux ? `mux-pool=${poolSize}` : 'mux=off';
-      log(`[proxy-client] Local HTTP/HTTPS proxy on ${formatEndpoint(httpProxy.server.address())} | mode=${values.mode} | ${muxInfo} | hops=${hops.length}`);
+      log(`[proxy-client] Local HTTP/HTTPS proxy on ${formatEndpoint(httpProxy.server.address())} | mode=${mode} | ${muxInfo} | hops=${hops.length}`);
     });
     closers.push((cb) => httpProxy.close(cb));
   }
 
   if (enableSocks) {
     const socksProxy = createLocalSocks5Proxy({
-      key: values.key,
-      mode: values.mode,
+      key,
+      mode,
       mux: useMux,
       pool: sharedPool,
       hops,
       exit,
-      tlsCa: values['tls-ca'],
-      tlsServername: values['tls-sni'],
-      tlsInsecure: values['tls-insecure'],
-      onRequest: ({ mode, mux, method, host, port, hopCount }) => {
-        log(`[proxy-client:${mode}${mux ? ':mux' : ''}] ${method} ${host}:${port} via ${hopCount} relay(s) + exit`);
+      auth: socksAuth,
+      tlsCa,
+      tlsServername,
+      tlsInsecure,
+      onRequest: ({ mode: m, mux, method, host, port, hopCount }) => {
+        log(`[proxy-client:${m}${mux ? ':mux' : ''}] ${method} ${host}:${port} via ${hopCount} relay(s) + exit`);
       },
       onError: (err) => log(`[proxy-client:socks5] Circuit error: ${formatError(err)}`),
     });
 
-    socksProxy.listen(values.socks, () => {
-      log(`[proxy-client] Local SOCKS5 (+UDP) proxy on ${formatEndpoint(socksProxy.server.address())} | mode=${values.mode} | hops=${hops.length}`);
+    socksProxy.listen(socksListen, () => {
+      log(`[proxy-client] Local SOCKS5 (+UDP) proxy on ${formatEndpoint(socksProxy.server.address())} | mode=${mode} | hops=${hops.length}`);
     });
     closers.push((cb) => socksProxy.close(cb));
   }
 
   if (enableTun) {
+    const tunCidr = values['tun-cidr'] ?? cfgTun?.cidr ?? null;
+    const rawMtu = values['tun-mtu'] ?? cfgTun?.mtu ?? null;
+    const tunMtu = rawMtu !== null && rawMtu !== undefined ? Number(rawMtu) : null;
+    const tunConfigure = values['no-tun-config'] ? false : (cfgTun?.configure ?? true);
+    const tunDefaultRoute = values['tun-default-route'] ?? cfgTun?.defaultRoute ?? false;
+    const tunExclude = (values['tun-exclude'] && values['tun-exclude'].length > 0)
+      ? values['tun-exclude']
+      : (cfgTun?.exclude || []);
+    const tunRoutes = (values['tun-route'] && values['tun-route'].length > 0)
+      ? values['tun-route']
+      : (cfgTun?.routes || []);
+
     const localTun = await createLocalTun({
-      ifname: values.tun,
-      cidr: values['tun-cidr'] || null,
-      mtu: values['tun-mtu'] ? Number(values['tun-mtu']) : null,
-      configure: !values['no-tun-config'],
-      defaultRoute: Boolean(values['tun-default-route']),
-      key: values.key,
-      mode: values.mode,
+      ifname: tunName,
+      cidr: tunCidr,
+      mtu: tunMtu,
+      configure: Boolean(tunConfigure),
+      defaultRoute: Boolean(tunDefaultRoute),
+      exclude: tunExclude,
+      routes: tunRoutes,
+      key,
+      mode,
       pool: sharedPool,
       hops,
       exit,
-      tlsCa: values['tls-ca'],
-      tlsServername: values['tls-sni'],
-      tlsInsecure: values['tls-insecure'],
+      tlsCa,
+      tlsServername,
+      tlsInsecure,
       onConnect: ({ ifname, clientIp, gatewayIp, prefixLen, mtu }) => {
         log(`[proxy-client:tun] Interface ${ifname} up (${clientIp}/${prefixLen} -> gw ${gatewayIp}, mtu=${mtu})`);
       },
@@ -445,14 +521,40 @@ async function runClient(argv) {
   process.on('SIGTERM', stop);
 }
 
-const [role, ...rest] = process.argv.slice(2);
-if (!role || role === '-h' || role === '--help' || role === 'help') {
+const rawArgs = process.argv.slice(2);
+if (rawArgs.length === 0 || rawArgs[0] === '-h' || rawArgs[0] === '--help' || rawArgs[0] === 'help') {
   console.log(HELP);
   process.exit(0);
 }
 
 (async () => {
   try {
+    // Support roleless `node cli.mjs -c config.json [overrides]`
+    if (rawArgs[0].startsWith('-')) {
+      const cfgPath = extractConfigFlag(rawArgs);
+      if (!cfgPath) {
+        die(`Missing role or -c <config.json>`);
+      }
+      const preloaded = loadProxyRoleConfig(cfgPath);
+      if (!preloaded.role) {
+        die(`Config file "${cfgPath}" must specify "role": "client" | "relay" | "exit"`);
+      }
+      switch (preloaded.role) {
+        case 'relay':
+          runRelay(rawArgs, preloaded);
+          return;
+        case 'exit':
+          runExit(rawArgs, preloaded);
+          return;
+        case 'client':
+          await runClient(rawArgs, preloaded);
+          return;
+        default:
+          die(`Unknown role "${preloaded.role}" in ${cfgPath}`);
+      }
+    }
+
+    const [role, ...rest] = rawArgs;
     switch (role) {
       case 'keygen':
         runKeygen(rest);

@@ -8,7 +8,18 @@ export {
   createLocalTun,
   createExitTunGateway,
   parseIpv4Cidr,
+  resolveTunRouteTargets,
 } from './ingress/tun.mjs';
+export {
+  loadProxyRoleConfig,
+  parseHopEntry,
+  extractConfigFlag,
+} from './config.mjs';
+export {
+  stripJsonc,
+  parseJsonc,
+  loadJsonConfig,
+} from './tunnel.mjs';
 export {
   registerMode,
   getMode,

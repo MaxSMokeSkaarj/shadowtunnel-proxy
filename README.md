@@ -85,9 +85,9 @@ curl -x http://127.0.0.1:8080 https://example.com
 На участке через провайдера с DPI первый репитер можно поднять на порту `443` под видом обычного HTTPS/WebSocket-сайта (или спрятать за Nginx / Cloudflare), а дальнейшие участки между зарубежными VPS оставить на чистом быстром TCP:
 
 ```bash
-# На 1-м репитере (отдаёт обычный сайт сканерам на всех путях, кроме секретного /v1/sync):
+# На 1-м репитере (отдаёт обычный сайт сканерам на всех путях, кроме секретного /ws/example-path):
 node cli.mjs relay -m ptp \
-  -l wss://:443/v1/sync \
+  -l wss://:443/ws/example-path \
   --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem \
   --tls-key /etc/letsencrypt/live/example.com/privkey.pem \
   --fallback 127.0.0.1:3000 \
@@ -95,7 +95,7 @@ node cli.mjs relay -m ptp \
 
 # На клиенте (1-й хоп идёт по wss://:443, а дальше до Exit — быстрый сырой TCP):
 node cli.mjs client -m ptp -l 127.0.0.1:8080 -k ./keys/client.key \
-  --hop wss://example.com:443/v1/sync,./keys/r1.pub \
+  --hop wss://example.com:443/ws/example-path,./keys/r1.pub \
   -e 203.0.113.9:5001,./keys/exit.pub
 ```
 
@@ -110,7 +110,7 @@ node cli.mjs client -m ptp \
   -l 127.0.0.1:8080 \
   -s 127.0.0.1:1080 \
   -k ./keys/client.key \
-  --hop wss://example.com:443/v1/sync,./keys/r1.pub \
+  --hop wss://example.com:443/ws/example-path,./keys/r1.pub \
   -e 203.0.113.9:5001,./keys/exit.pub
 
 # Проверка через SOCKS5 (с резолвингом DNS на стороне Exit):
@@ -128,14 +128,73 @@ curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 sudo node cli.mjs exit -l :5001 -k ./keys/exit.key -a ./keys/r1.pub \
   --tun st0 --tun-cidr 10.99.0.1/24 --nat
 
-# На клиенте (полный заворот трафика системы с авто-обходом IP входного репитера):
-sudo node cli.mjs client -m ptp -k ./keys/client.key \
-  --hop wss://example.com:443/v1/sync,./keys/r1.pub \
+# На клиенте (полный заворот трафика системы с авто-обходом IP входного репитера и списка исключений):
+sudo "$(which node)" cli.mjs client -m ptp -k ./keys/client.key \
+  --hop wss://example.com:443/ws/example-path,./keys/r1.pub \
   -e 203.0.113.9:5001,./keys/exit.pub \
-  --no-http --tun st0 --tun-default-route
+  --no-http --tun st0 --tun-default-route \
+  --tun-exclude ./bypass.txt
+```
+
+Формат файла для `--tun-exclude <файл>` и `--tun-route <файл>` (по одному IP, CIDR или домену на строку; если у домена несколько `A`-записей IPv4 — добавляются все, а IPv6 игнорируется; при остановке клиента все маршруты и таблица `nftables` на Exit автоматически удаляются):
+```text
+# Домашние/рабочие сети и прямые серверы
+198.51.100.10
+192.168.0.0/16
+git.example.org
 ```
 
 > **Запуск `--tun` без `root`:** можно один раз создать постоянный интерфейс от пользователя (`sudo ip tuntap add dev st0 mode tun user $USER && sudo ip addr add 10.99.0.2/24 dev st0 && sudo ip link set dev st0 mtu 1400 up`) и запускать клиент с флагом `--no-tun-config`.
+
+---
+
+## Конфигурационный файл JSON / JSONC (`-c / --config`)
+
+Все роли (`client`, `relay`, `exit`) можно запускать одной командой `node cli.mjs -c config.json` (поддерживаются `//` и `/* */` комментарии, висячие запятые, строковые публичные ключи прямо внутри JSON и относительные пути от папки конфига; любые флаги CLI поверх `-c` имеют приоритет):
+
+```json
+{
+  // Пример client.json
+  "role": "client",
+  "mode": "ptp",
+  "key": "./keys/client.key",
+  "pool": 2,
+
+  "http": "127.0.0.1:8080",
+  "socks": "127.0.0.1:1080",
+
+  "tun": {
+    "enabled": false,
+    "name": "st0",
+    "mtu": 1320,
+    "defaultRoute": false,
+    "exclude": ["./bypass.txt", "198.51.100.10"],
+    "routes": []
+  },
+
+  "hops": [
+    {
+      "endpoint": "198.51.100.1:5001",
+      "publicKey": "./keys/r1.pub"
+    },
+    {
+      "endpoint": "wss://relay2.example.com:443/ws/example-path",
+      "publicKey": "./keys/r2.pub"
+    }
+  ],
+
+  "exit": {
+    "endpoint": "203.0.113.9:5001",
+    "publicKey": "./keys/exit.pub"
+  }
+}
+```
+
+```bash
+# Запуск по конфигу (или быстрое переопределение режима флагом поверх конфига):
+node cli.mjs -c ./client.json
+node cli.mjs -c ./client.json -m onion
+```
 
 ---
 

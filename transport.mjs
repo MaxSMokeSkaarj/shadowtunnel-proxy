@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
+import path from 'node:path';
 import tls from 'node:tls';
 import { Duplex } from 'node:stream';
 
@@ -736,4 +737,151 @@ export function createTransportServer(options, onCarrierConnection) {
   }
 
   return net.createServer({ allowHalfOpen: true }, handleIncomingSocket);
+}
+
+// --- Zero-Dependency String-Safe JSON / JSONC Config Loader ---
+
+export function stripJsonc(text) {
+  const src = String(text).replace(/^\uFEFF/, '');
+  let noComments = '';
+  let i = 0;
+  let inString = false;
+
+  while (i < src.length) {
+    const ch = src[i];
+
+    if (inString) {
+      noComments += ch;
+      if (ch === '\\' && i + 1 < src.length) {
+        noComments += src[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      noComments += ch;
+      i += 1;
+      continue;
+    }
+
+    // Single-line // comment outside string literals (preserves "wss://..." inside strings!)
+    if (ch === '/' && src[i + 1] === '/') {
+      i += 2;
+      while (i < src.length && src[i] !== '\n') i += 1;
+      continue;
+    }
+
+    // Multi-line /* ... */ comment outside string literals (preserves newlines for error reporting)
+    if (ch === '/' && src[i + 1] === '*') {
+      i += 2;
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) {
+        if (src[i] === '\n') noComments += '\n';
+        i += 1;
+      }
+      i += 2;
+      continue;
+    }
+
+    noComments += ch;
+    i += 1;
+  }
+
+  // Strip trailing commas before '}' or ']' outside string literals
+  let clean = '';
+  inString = false;
+  i = 0;
+  while (i < noComments.length) {
+    const ch = noComments[i];
+    if (inString) {
+      clean += ch;
+      if (ch === '\\' && i + 1 < noComments.length) {
+        clean += noComments[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      clean += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === ',') {
+      let j = i + 1;
+      while (j < noComments.length && /\s/.test(noComments[j])) j += 1;
+      if (noComments[j] === '}' || noComments[j] === ']') {
+        i += 1;
+        continue;
+      }
+    }
+    clean += ch;
+    i += 1;
+  }
+
+  return clean;
+}
+
+export function parseJsonc(text, sourceLabel = 'config') {
+  try {
+    const parsed = JSON.parse(stripJsonc(text));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Root value must be a JSON object');
+    }
+    return parsed;
+  } catch (err) {
+    throw new Error(`Invalid JSON config in ${sourceLabel}: ${err.message}`);
+  }
+}
+
+export function loadJsonConfig(configFilePath) {
+  const absPath = path.resolve(configFilePath);
+  if (!fs.existsSync(absPath)) {
+    throw new Error(`Config file not found: ${absPath}`);
+  }
+  const raw = fs.readFileSync(absPath, 'utf8');
+  const data = parseJsonc(raw, absPath);
+  return {
+    config: data,
+    configPath: absPath,
+    baseDir: path.dirname(absPath),
+  };
+}
+
+export function resolvePathFromConfig(value, baseDir) {
+  if (!value || typeof value !== 'string') return value;
+  if (value.includes('-----BEGIN ')) return value;
+  return path.resolve(baseDir, value);
+}
+
+export function resolveKeySpecFromConfig(value, baseDir) {
+  if (!value) return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => resolveKeySpecFromConfig(item, baseDir));
+  }
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (trimmed.startsWith('ed25519 ') || trimmed.includes('-----BEGIN ') || trimmed.includes('\n')) {
+    return trimmed;
+  }
+  return path.resolve(baseDir, trimmed);
+}
+
+export function resolveEndpointFromConfig(endpoint, baseDir) {
+  if (!endpoint || typeof endpoint !== 'string') return endpoint;
+  const trimmed = endpoint.trim();
+  if (trimmed.startsWith('./') || trimmed.startsWith('../')) {
+    return path.resolve(baseDir, trimmed);
+  }
+  if (trimmed.startsWith('unix:./') || trimmed.startsWith('unix:../')) {
+    return `unix:${path.resolve(baseDir, trimmed.slice(5))}`;
+  }
+  return trimmed;
 }
