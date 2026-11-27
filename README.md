@@ -1,8 +1,17 @@
 # shadowtunnel-proxy
 
-Портативный многохоповый HTTP / HTTPS (`CONNECT`) прокси на базе **ShadowTunnel** без внешних зависимостей (только встроенные модули Node.js ≥ 20).
+Портативный многохоповый прокси и VPN (`HTTP/HTTPS`, `SOCKS5 + UDP`, `Linux L3 TUN`) на базе **ShadowTunnel** без единой внешней зависимости (только встроенные модули Node.js ≥ 20 и штатные средства ОС).
 
-Поддерживает **произвольное количество промежуточных ретрансляторов (`0..N`)** между клиентом и выходным сервером, а также выбор режима шифрования (`onion` или `ptp`).
+Поддерживает **произвольное количество промежуточных ретрансляторов (`0..N`)**, расширяемую систему режимов маршрутизации (`modes/onion.mjs`, `modes/ptp.mjs` + регистрация своих плагинов через `registerMode`), маскировку под HTTPS/WebSocket (`wss://` + `--fallback`) и **мультиплексирование потоков и датаграмм по умолчанию** (пул прогретых постоянных цепочек `--pool 2` с автопереподключением и ротацией сессионных ключей).
+
+---
+
+## Модульная структура
+
+- `modes/` — подключаемые режимы построения цепочек (`onion.mjs`, `ptp.mjs`, реестр `modes/index.mjs`).
+- `ingress/` — входные адаптеры (`ingress/http.mjs`, `ingress/socks5.mjs`, `ingress/tun.mjs`), разделяющие общий пул каналов `MuxCircuitPool`.
+- `relay.mjs` / `exit.mjs` / `pool.mjs` — сервер-репитер, выходной узел (TCP + UDP + TUN/NAT) и пул мультиплексированных каналов.
+- `crypto.mjs` / `transport.mjs` / `tunnel.mjs` / `mux.mjs` — базовые модули ядра **ShadowTunnel**.
 
 ---
 
@@ -68,3 +77,62 @@ node cli.mjs client -m ptp -l 127.0.0.1:8080 -k ./keys/client.key -e 198.51.100.
 ```bash
 curl -x http://127.0.0.1:8080 https://example.com
 ```
+
+---
+
+## Маскировка от DPI (`wss://` / `tls://` + `--fallback`)
+
+На участке через провайдера с DPI первый репитер можно поднять на порту `443` под видом обычного HTTPS/WebSocket-сайта (или спрятать за Nginx / Cloudflare), а дальнейшие участки между зарубежными VPS оставить на чистом быстром TCP:
+
+```bash
+# На 1-м репитере (отдаёт обычный сайт сканерам на всех путях, кроме секретного /v1/sync):
+node cli.mjs relay -m ptp \
+  -l wss://:443/v1/sync \
+  --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem \
+  --tls-key /etc/letsencrypt/live/example.com/privkey.pem \
+  --fallback 127.0.0.1:3000 \
+  -k ./keys/r1.key -a ./keys/authorized_keys
+
+# На клиенте (1-й хоп идёт по wss://:443, а дальше до Exit — быстрый сырой TCP):
+node cli.mjs client -m ptp -l 127.0.0.1:8080 -k ./keys/client.key \
+  --hop wss://example.com:443/v1/sync,./keys/r1.pub \
+  -e 203.0.113.9:5001,./keys/exit.pub
+```
+
+---
+
+## SOCKS5 + UDP (`-s / --socks`) — кроссплатформенно и без `root`
+
+Клиент может одновременно держать локальный HTTP-прокси (`-l`) и SOCKS5-прокси с поддержкой `TCP CONNECT` и `UDP ASSOCIATE` (`-s`, для игр, звонков, QUIC/HTTP3 и DNS) поверх одних и тех же прогретых цепочек:
+
+```bash
+node cli.mjs client -m ptp \
+  -l 127.0.0.1:8080 \
+  -s 127.0.0.1:1080 \
+  -k ./keys/client.key \
+  --hop wss://example.com:443/v1/sync,./keys/r1.pub \
+  -e 203.0.113.9:5001,./keys/exit.pub
+
+# Проверка через SOCKS5 (с резолвингом DNS на стороне Exit):
+curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
+```
+
+---
+
+## Системный L3 VPN на Linux (`--tun`)
+
+В режиме `--tun` создаётся ядерный сетевой интерфейс `/dev/net/tun` без сторонних библиотек — через многохоповый туннель прозрачно проходят **любые IPv4-пакеты** (`ICMP ping`, `TCP`, `UDP`, `QUIC`), а Exit автоматически выдаёт клиенту свободный IP из пула и поднимает `MASQUERADE` (`--nat`):
+
+```bash
+# На Exit-сервере (Linux VPS):
+sudo node cli.mjs exit -l :5001 -k ./keys/exit.key -a ./keys/r1.pub \
+  --tun st0 --tun-cidr 10.99.0.1/24 --nat
+
+# На клиенте (полный заворот трафика системы с авто-обходом IP входного репитера):
+sudo node cli.mjs client -m ptp -k ./keys/client.key \
+  --hop wss://example.com:443/v1/sync,./keys/r1.pub \
+  -e 203.0.113.9:5001,./keys/exit.pub \
+  --no-http --tun st0 --tun-default-route
+```
+
+> **Запуск `--tun` без `root`:** можно один раз создать постоянный интерфейс от пользователя (`sudo ip tuntap add dev st0 mode tun user $USER && sudo ip addr add 10.99.0.2/24 dev st0 && sudo ip link set dev st0 mtu 1400 up`) и запускать клиент с флагом `--no-tun-config`.

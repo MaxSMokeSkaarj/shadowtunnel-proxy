@@ -12,6 +12,7 @@ export const MSG_DATA = 0x10;
 export const MSG_EOF = 0x11;
 export const MSG_PING = 0x12;
 export const MSG_PONG = 0x13;
+export const MSG_REKEY = 0x14;
 
 // Protocol size constants
 export const FRAME_HEADER_SIZE = 5; // [type:1][length:4 BE]
@@ -22,15 +23,22 @@ export const X25519_SPKI_SIZE = 44;
 export const ED25519_SPKI_SIZE = 44;
 export const ED25519_SIG_SIZE = 64;
 
-export const CLIENT_HELLO_SIZE = HANDSHAKE_NONCE_SIZE + X25519_SPKI_SIZE; // 60
-export const INNER_AUTH_SIZE = ED25519_SPKI_SIZE + ED25519_SIG_SIZE; // 108
-export const SERVER_HELLO_SIZE = HANDSHAKE_NONCE_SIZE + X25519_SPKI_SIZE + INNER_AUTH_SIZE + AEAD_TAG_SIZE; // 184
-export const CLIENT_AUTH_SIZE = INNER_AUTH_SIZE + AEAD_TAG_SIZE; // 124
-export const SERVER_READY_SIZE = AEAD_TAG_SIZE; // 16
+export const CLIENT_HELLO_SIZE = HANDSHAKE_NONCE_SIZE + X25519_SPKI_SIZE; // 60 min
+export const INNER_AUTH_SIZE = ED25519_SPKI_SIZE + ED25519_SIG_SIZE; // 108 min
+export const SERVER_HELLO_SIZE = HANDSHAKE_NONCE_SIZE + X25519_SPKI_SIZE + INNER_AUTH_SIZE + AEAD_TAG_SIZE; // 184 min
+export const CLIENT_AUTH_SIZE = INNER_AUTH_SIZE + AEAD_TAG_SIZE; // 124 min
+export const SERVER_READY_SIZE = AEAD_TAG_SIZE; // 16 min
+export const MAX_HANDSHAKE_PAD = 256;
+
+export const CLIENT_HELLO_MAX_SIZE = CLIENT_HELLO_SIZE + MAX_HANDSHAKE_PAD;
+export const SERVER_HELLO_MAX_SIZE = SERVER_HELLO_SIZE + MAX_HANDSHAKE_PAD;
+export const CLIENT_AUTH_MAX_SIZE = CLIENT_AUTH_SIZE + MAX_HANDSHAKE_PAD;
+export const SERVER_READY_MAX_SIZE = SERVER_READY_SIZE + MAX_HANDSHAKE_PAD;
 
 export const MAX_PLAINTEXT_SIZE = 65536; // 64 KiB
 export const MAX_DATA_FRAME_SIZE = MAX_PLAINTEXT_SIZE + AEAD_TAG_SIZE; // 65552
 export const MAX_CONTROL_FRAME_SIZE = 64 + AEAD_TAG_SIZE;
+export const REKEY_FRAME_SIZE = 1 + AEAD_TAG_SIZE; // 17 bytes ([requestPeerUpdate:1] + GCM tag)
 const MAX_SEQ = 0xffff_ffff_ffff_fffen;
 
 const SERVER_SIG_CONTEXT = Buffer.from('socket-tunnel-v1/server-sig:', 'utf8');
@@ -170,21 +178,27 @@ export function loadAuthorizedKeys(filePathOrContent) {
   if (filePathOrContent instanceof Map) return filePathOrContent;
   if (
     filePathOrContent instanceof crypto.KeyObject ||
-    (filePathOrContent && typeof filePathOrContent === 'object' && filePathOrContent.publicKey instanceof crypto.KeyObject)
+    (filePathOrContent && typeof filePathOrContent === 'object' && filePathOrContent.publicKey instanceof crypto.KeyObject) ||
+    (Buffer.isBuffer(filePathOrContent) && filePathOrContent.length === ED25519_SPKI_SIZE)
   ) {
-    return loadAuthorizedKeys([filePathOrContent]);
+    const entry = parsePublicKey(filePathOrContent);
+    const map = new Map();
+    map.set(entry.spkiDer.toString('hex'), entry);
+    return map;
   }
   if (Array.isArray(filePathOrContent)) {
     const map = new Map();
     for (const item of filePathOrContent) {
-      const entry = loadPublicKey(item);
-      map.set(entry.spkiDer.toString('hex'), entry);
+      for (const [k, v] of loadAuthorizedKeys(item)) {
+        map.set(k, v);
+      }
     }
     return map;
   }
-  const content = fs.existsSync(filePathOrContent)
-    ? fs.readFileSync(filePathOrContent, 'utf8')
-    : String(filePathOrContent);
+  const str = Buffer.isBuffer(filePathOrContent) ? filePathOrContent.toString('utf8') : String(filePathOrContent);
+  const content = (!str.includes('BEGIN ') && !str.startsWith('ed25519 ') && !str.includes('\n') && fs.existsSync(str))
+    ? fs.readFileSync(str, 'utf8')
+    : str;
   return parseAuthorizedKeys(content);
 }
 
@@ -307,6 +321,18 @@ export class CipherState {
     this._key = key;
     this._ivSalt = ivSalt;
     this._seq = 0n;
+    this.epoch = 0;
+  }
+
+  ratchet() {
+    const nextKey = hkdfExpand(this._key, this._ivSalt, 'socket-tunnel-v1/rekey/key', 32);
+    const nextIv = hkdfExpand(this._key, this._ivSalt, 'socket-tunnel-v1/rekey/iv', NONCE_SIZE);
+    this._key.fill(0);
+    this._ivSalt.fill(0);
+    this._key = nextKey;
+    this._ivSalt = nextIv;
+    this._seq = 0n;
+    this.epoch++;
   }
 
   _nextNonceAndAad(frameType) {
@@ -379,14 +405,15 @@ export function encodeFrame(type, payload) {
 
 export function defaultMaxFrameSize(type) {
   switch (type) {
-    case MSG_CLIENT_HELLO: return CLIENT_HELLO_SIZE;
-    case MSG_SERVER_HELLO: return SERVER_HELLO_SIZE;
-    case MSG_CLIENT_AUTH: return CLIENT_AUTH_SIZE;
-    case MSG_SERVER_READY: return SERVER_READY_SIZE;
+    case MSG_CLIENT_HELLO: return CLIENT_HELLO_MAX_SIZE;
+    case MSG_SERVER_HELLO: return SERVER_HELLO_MAX_SIZE;
+    case MSG_CLIENT_AUTH: return CLIENT_AUTH_MAX_SIZE;
+    case MSG_SERVER_READY: return SERVER_READY_MAX_SIZE;
     case MSG_DATA: return MAX_DATA_FRAME_SIZE;
     case MSG_EOF: return AEAD_TAG_SIZE;
     case MSG_PING:
     case MSG_PONG: return MAX_CONTROL_FRAME_SIZE;
+    case MSG_REKEY: return REKEY_FRAME_SIZE;
     default: return -1;
   }
 }
