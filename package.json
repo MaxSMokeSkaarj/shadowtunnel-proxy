@@ -3,6 +3,12 @@
   "version": "1.3.0",
   "description": "Zero-dependency modular multi-hop HTTP, SOCKS5 (+UDP) & Linux TUN proxy/VPN (Onion & PTP + Stream Mux + TLS/WSS Camouflage)",
   "license": "AGPL-3.0-only",
+  "contributors": [
+    {
+      "name": "Jing Lee",
+      "url": "https://t.me/TES286_lijing"
+    }
+  ],
   "type": "module",
   "main": "./index.mjs",
   "exports": {

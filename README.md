@@ -136,3 +136,9 @@ sudo node cli.mjs client -m ptp -k ./keys/client.key \
 ```
 
 > **Запуск `--tun` без `root`:** можно один раз создать постоянный интерфейс от пользователя (`sudo ip tuntap add dev st0 mode tun user $USER && sudo ip addr add 10.99.0.2/24 dev st0 && sudo ip link set dev st0 mtu 1400 up`) и запускать клиент с флагом `--no-tun-config`.
+
+---
+
+## Благодарности
+
+Особая благодарность **[Jing Lee (@TES286_lijing)](https://t.me/TES286_lijing)** за архитектурное ревью и идеи, которые легли в основу обновления: поддержка `UDP` (`SOCKS5`), системный `TUN`-режим, пул мультиплексированных каналов и защита от активного пробинга DPI.
