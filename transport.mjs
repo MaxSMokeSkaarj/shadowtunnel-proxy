@@ -10,14 +10,11 @@ const MAX_WS_PAYLOAD = 256 * 1024;
 const MAX_WS_WRITE_CHUNK = 32768;
 const MAX_HTTP_UPGRADE_HEADER = 16 * 1024;
 
-const DECOY_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Welcome</title>
-<style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:10vh auto;padding:0 1rem;color:#222;line-height:1.5}</style>
-</head>
-<body><h1>Service Online</h1><p>The server is operational.</p></body>
-</html>
-`;
+// Byte-identical stock nginx 404 body (avoids custom Shodan/Censys HTML fingerprints when --fallback is unset)
+const STOCK_NGINX_404_HTML =
+  '<html>\r\n<head><title>404 Not Found</title></head>\r\n' +
+  '<body>\r\n<center><h1>404 Not Found</h1></center>\r\n' +
+  '<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n';
 
 // --- Endpoint Parsing (tcp://, tls://, ws://, wss://, unix:) ---
 
@@ -534,7 +531,7 @@ export function dialTransport(ep, options = {}) {
 
 // --- Server Transport Listener + Active-Probe Decoy Fallback ---
 
-function handleProbeFallback(rawSocket, capturedBytes, fallbackEndpoint) {
+export function handleProbeFallback(rawSocket, capturedBytes, fallbackEndpoint) {
   if (fallbackEndpoint) {
     const fbEp = parseEndpoint(fallbackEndpoint, '127.0.0.1');
     const fbSock = fbEp.path
@@ -561,19 +558,17 @@ function handleProbeFallback(rawSocket, capturedBytes, fallbackEndpoint) {
     return;
   }
 
-  // Built-in realistic web server response for browsers / DPI probes
+  // Standard un-fingerprintable nginx 404 response for generic HTTP/HTTPS probes when --fallback is unset
   const reqLine = capturedBytes.subarray(0, Math.min(capturedBytes.length, 128)).toString('latin1').split('\r\n')[0] || '';
-  const isRootGet = /^(GET|HEAD)\s+\/(\?.*)?\s+HTTP\/1\.[01]$/.test(reqLine);
   const isHead = reqLine.startsWith('HEAD ');
-  const status = isRootGet ? '200 OK' : '404 Not Found';
-  const body = isRootGet ? DECOY_HTML : '<!DOCTYPE html><html><body><h1>404 Not Found</h1></body></html>\n';
+  const body = STOCK_NGINX_404_HTML;
   const dateHdr = new Date().toUTCString();
 
   const headers =
-    `HTTP/1.1 ${status}\r\n` +
+    `HTTP/1.1 404 Not Found\r\n` +
     `Server: nginx\r\n` +
     `Date: ${dateHdr}\r\n` +
-    `Content-Type: text/html; charset=utf-8\r\n` +
+    `Content-Type: text/html\r\n` +
     `Content-Length: ${Buffer.byteLength(body)}\r\n` +
     `Connection: close\r\n\r\n`;
 
@@ -609,7 +604,9 @@ export function createTransportServer(options, onCarrierConnection) {
     const isTls = protocol === 'tls' || protocol === 'wss' || hasTlsMaterial;
     const isWs = protocol === 'ws' || protocol === 'wss';
 
-    if (!isWs && !isTls && !fallback) {
+    // Raw TCP (with or without --fallback) passes directly to TunnelServer, which authenticates
+    // CLIENT_HELLO or diverts any non-tunnel probe stream from byte 0 into --fallback / tarpit.
+    if (!isWs && !isTls) {
       onCarrierConnection(sock);
       return;
     }

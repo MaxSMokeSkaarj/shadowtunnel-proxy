@@ -15,7 +15,8 @@ export const MUX_DGRAM = 0x08;
 export const MUX_GOAWAY = 0x09;
 
 export const MUX_HEADER_SIZE = 9; // [type:1][streamId:4 BE][length:4 BE]
-// 16 KiB max data chunk guarantees multi-hop Onion + Mux frames never split across 32 KiB WebSocket chunks
+// 14..16 KiB jittered max data chunk prevents fixed 16456B beacons & never splits across 32 KiB WS frames
+export const MIN_MUX_CHUNK_JITTER = 14336;
 export const MAX_MUX_CHUNK = 16384;
 export const MAX_MUX_META = 4096;
 const MAX_MUX_META_WIRE = MAX_MUX_META + 256;
@@ -278,7 +279,11 @@ export class MuxStream extends Duplex {
       }
 
       while (offset < buf.length && this._sendWindow > 0 && !this.session._carrierBackpressured) {
-        const len = Math.min(buf.length - offset, MAX_MUX_CHUNK, this._sendWindow);
+        const remaining = buf.length - offset;
+        const chunkCap = remaining > MIN_MUX_CHUNK_JITTER
+          ? crypto.randomInt(MIN_MUX_CHUNK_JITTER, MAX_MUX_CHUNK + 1)
+          : MAX_MUX_CHUNK;
+        const len = Math.min(remaining, chunkCap, this._sendWindow);
         const slice = buf.subarray(offset, offset + len);
         this._sendWindow -= len;
         offset += len;

@@ -1,6 +1,6 @@
 {
   "name": "shadowtunnel-proxy",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Zero-dependency modular multi-hop HTTP, SOCKS5 (+UDP) & Linux TUN proxy/VPN (Onion & PTP + Stream Mux + TLS/WSS Camouflage)",
   "license": "AGPL-3.0-only",
   "contributors": [

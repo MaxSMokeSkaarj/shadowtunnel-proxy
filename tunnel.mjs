@@ -7,7 +7,7 @@ import {
   CLIENT_AUTH_MAX_SIZE,
   CLIENT_AUTH_SIZE,
   CLIENT_HELLO_MAX_SIZE,
-  CLIENT_HELLO_SIZE,
+  DEFAULT_MAX_CLOCK_SKEW_SEC,
   ED25519_SIG_SIZE,
   ED25519_SPKI_SIZE,
   FrameParser,
@@ -18,6 +18,7 @@ import {
   MSG_CLIENT_AUTH,
   MSG_CLIENT_HELLO,
   MSG_DATA,
+  MSG_DATA_PAD,
   MSG_EOF,
   MSG_PING,
   MSG_PONG,
@@ -25,22 +26,24 @@ import {
   MSG_SERVER_HELLO,
   MSG_SERVER_READY,
   ProtocolError,
+  ReplayCache,
   SERVER_HELLO_MAX_SIZE,
   SERVER_HELLO_SIZE,
   SERVER_READY_MAX_SIZE,
   SERVER_READY_SIZE,
+  SH_SEED_SIZE,
   Transcript,
+  UNPINNED_HANDSHAKE_KEY,
   X25519_RAW_SIZE,
-  X25519_SPKI_SIZE,
   computeFingerprint,
   computeSharedSecret,
   defaultMaxFrameSize,
   deriveCipherPair,
-  encodeSaltedHandshakeFrame,
+  encodeClientHelloFrame,
+  encodeServerHelloFrame,
   generateEphemeralKeys,
   generateIdentity,
   importEd25519PublicKey,
-  importX25519PublicKey,
   importX25519RawPublicKey,
   loadAuthorizedKeys,
   loadPrivateKey,
@@ -57,6 +60,7 @@ import {
   createTransportServer,
   dialTransport,
   formatEndpoint,
+  handleProbeFallback,
   loadJsonConfig,
   parseEndpoint,
   parseJsonc,
@@ -89,6 +93,14 @@ const STATE_WAIT_SERVER_READY = 'WAIT_SERVER_READY';
 const STATE_OPEN = 'OPEN';
 const STATE_CLOSED = 'CLOSED';
 
+const MAX_PREAUTH_CAPTURE_BYTES = 8192;
+const MAX_TARPIT_DRAIN_BYTES = 65536;
+const SMALL_FRAME_PAD_THRESHOLD = 256;
+const MTU_FRAME_PAD_THRESHOLD = 1360;
+
+// Default process-wide replay cache used when server TunnelSocket is constructed standalone
+const defaultServerReplayCache = new ReplayCache();
+
 export function formatError(err) {
   if (!err) return 'Unknown error';
   if (typeof err === 'string') return err;
@@ -112,6 +124,11 @@ export class TunnelSocket extends Duplex {
       authorizedKeys,
       allowAnyClient = false,
       authorizeClient = null,
+      allowUnpinnedClientHello = false,
+      replayCache = null,
+      maxClockSkewSec = DEFAULT_MAX_CLOCK_SKEW_SEC,
+      onProbeFallback = null,
+      trafficPadding = true,
       handshakeTimeoutMs = 10_000,
       keepAliveMs = 30_000,
       keepAliveTimeoutMs = 10_000,
@@ -137,6 +154,9 @@ export class TunnelSocket extends Duplex {
     this.recvEpoch = 0;
 
     this._identity = loadPrivateKey(key);
+    this._trafficPadding = Boolean(trafficPadding);
+    this._maxClockSkewSec = Math.max(5, Number(maxClockSkewSec) || DEFAULT_MAX_CLOCK_SKEW_SEC);
+
     if (role === 'client') {
       if (!serverPublicKey && !allowAnyServer && typeof verifyServer !== 'function') {
         throw new TypeError('Client TunnelSocket requires "serverPublicKey", "verifyServer", or "allowAnyServer"');
@@ -155,17 +175,28 @@ export class TunnelSocket extends Duplex {
       this._authorizedKeys = authorizedKeys ? loadAuthorizedKeys(authorizedKeys) : null;
       this._allowAnyClient = Boolean(allowAnyClient);
       this._authorizeClient = authorizeClient;
+      this._allowUnpinnedClientHello = Boolean(allowUnpinnedClientHello);
+      this._replayCache = replayCache || defaultServerReplayCache;
+      this._onProbeFallback = typeof onProbeFallback === 'function' ? onProbeFallback : null;
       this._state = STATE_WAIT_CLIENT_HELLO;
     }
 
     this._transcript = new Transcript();
     this._eph = null;
+    this._shSeed = null;
     this._rawShared = null;
     this._hsSend = null;
     this._hsRecv = null;
     this._sendCipher = null;
     this._recvCipher = null;
     this._th2 = null;
+
+    this._preAuthChunks = role === 'server' ? [] : null;
+    this._preAuthBytes = 0;
+    this._fallbackProbeTimer = null;
+    this._tarpitting = false;
+    this._tarpitError = null;
+    this._tarpitDrainedBytes = 0;
 
     this._localEofSent = false;
     this._remoteEofReceived = false;
@@ -175,6 +206,7 @@ export class TunnelSocket extends Duplex {
     this._handshakeTimer = null;
     this._keepAliveInterval = null;
     this._pongTimer = null;
+    this._pongSendDelayTimer = null;
     this._keepAliveMs = keepAliveMs;
     this._keepAliveTimeoutMs = keepAliveTimeoutMs;
     this._lastActivityAt = Date.now();
@@ -189,17 +221,30 @@ export class TunnelSocket extends Duplex {
     this._parser = new FrameParser(
       (type, payload, salt) => this._onFrame(type, payload, salt),
       (type) => this._maxAllowedPayload(type),
-      role === 'client' ? 'salted-sh' : 'salted-ch',
+      'plain',
     );
+
+    if (role === 'server') {
+      const chSecrets = [this._identity.spkiDer];
+      if (this._allowUnpinnedClientHello) {
+        chSecrets.push(UNPINNED_HANDSHAKE_KEY);
+      }
+      this._parser.setClientHelloSecrets(chSecrets);
+    }
 
     this._bindRawSocket();
 
     if (handshakeTimeoutMs > 0) {
+      // Server-side timeout is jittered (0.65x..1.35x) so active probes observe no deterministic timer cliff
+      const effectiveTimeoutMs = role === 'server'
+        ? Math.max(25, Math.round(handshakeTimeoutMs * (0.65 + Math.random() * 0.7)))
+        : handshakeTimeoutMs;
+
       this._handshakeTimer = setTimeout(() => {
         if (this._state !== STATE_OPEN && this._state !== STATE_CLOSED) {
-          this.destroy(new ProtocolError('Handshake timed out', 'ERR_HANDSHAKE_TIMEOUT'));
+          this.destroy(this._tarpitError || new ProtocolError('Handshake timed out', 'ERR_HANDSHAKE_TIMEOUT'));
         }
-      }, handshakeTimeoutMs);
+      }, effectiveTimeoutMs);
       this._handshakeTimer.unref?.();
     }
 
@@ -233,6 +278,7 @@ export class TunnelSocket extends Duplex {
       case STATE_OPEN:
         if (
           type === MSG_DATA ||
+          type === MSG_DATA_PAD ||
           type === MSG_EOF ||
           type === MSG_PING ||
           type === MSG_PONG ||
@@ -246,29 +292,123 @@ export class TunnelSocket extends Duplex {
     }
   }
 
+  _enterPreAuthFailure(err) {
+    if (this.destroyed || this._state === STATE_CLOSED) return;
+
+    // If a fallback backend is configured, seamlessly pipe all captured bytes + raw socket to it
+    if (this._onProbeFallback && this._preAuthChunks) {
+      const captured = Buffer.concat(this._preAuthChunks, this._preAuthBytes);
+      const fallbackFn = this._onProbeFallback;
+      this._detachRawSocketWithoutDestroy();
+      this.emit('probeFallback', err);
+      fallbackFn(this.rawSocket, captured);
+      return;
+    }
+
+    // Otherwise enter silent blackhole tarpit: send 0 bytes, avoid instant TCP RST/FIN probing oracle
+    this._tarpitting = true;
+    this._tarpitError = err;
+    this._preAuthChunks = null;
+    this._preAuthBytes = 0;
+    this._parser.stop();
+    this._zeroHandshakeSecrets();
+
+    if (!this._handshakeTimer) {
+      this._handshakeTimer = setTimeout(() => {
+        if (!this.destroyed && this._state !== STATE_CLOSED) {
+          this.destroy(this._tarpitError || new ProtocolError('Handshake timed out', 'ERR_HANDSHAKE_TIMEOUT'));
+        }
+      }, crypto.randomInt(3_000, 9_000));
+      this._handshakeTimer.unref?.();
+    }
+  }
+
+  _detachRawSocketWithoutDestroy() {
+    this._state = STATE_CLOSED;
+    this._pendingPostHandshake = null;
+    this._preAuthChunks = null;
+    this._preAuthBytes = 0;
+    if (this._cancelDrainWait) this._cancelDrainWait();
+    if (this._handshakeTimer) {
+      clearTimeout(this._handshakeTimer);
+      this._handshakeTimer = null;
+    }
+    if (this._fallbackProbeTimer) {
+      clearTimeout(this._fallbackProbeTimer);
+      this._fallbackProbeTimer = null;
+    }
+    this._stopKeepAlive();
+    this._parser.stop();
+    this._zeroHandshakeSecrets();
+    this.rawSocket.off?.('data', this._onRawData);
+    this.rawSocket.off?.('error', this._onRawError);
+    this.rawSocket.off?.('close', this._onRawClose);
+    this.rawSocket.off?.('end', this._onRawEnd);
+    this.rawSocket.pause?.();
+  }
+
   _bindRawSocket() {
     this._onRawData = (chunk) => {
+      if (this._tarpitting) {
+        this._tarpitDrainedBytes += chunk.length;
+        if (this._tarpitDrainedBytes > MAX_TARPIT_DRAIN_BYTES) {
+          this.destroy(this._tarpitError);
+        }
+        return;
+      }
+
+      if (this._state === STATE_WAIT_CLIENT_HELLO && this._preAuthChunks && this._preAuthBytes < MAX_PREAUTH_CAPTURE_BYTES) {
+        const take = Math.min(chunk.length, MAX_PREAUTH_CAPTURE_BYTES - this._preAuthBytes);
+        this._preAuthChunks.push(Buffer.from(chunk.subarray(0, take)));
+        this._preAuthBytes += take;
+      }
+
       this._resetKeepAliveActivity();
       try {
         this._parser.push(chunk);
       } catch (err) {
-        this.destroy(err);
+        if (this.role === 'server' && this._state === STATE_WAIT_CLIENT_HELLO) {
+          this._enterPreAuthFailure(err);
+        } else {
+          this.destroy(err);
+        }
+        return;
+      }
+
+      // If --fallback is configured and initial bytes did not complete a valid CLIENT_HELLO immediately
+      // (e.g. HTTP/1.1 keep-alive GET ~75B < 8 key-slots), wait 30ms for split TCP segments then hand off to fallback.
+      if (
+        this.role === 'server' &&
+        this._state === STATE_WAIT_CLIENT_HELLO &&
+        this._onProbeFallback &&
+        !this._parser._chMatched &&
+        !this._fallbackProbeTimer
+      ) {
+        this._fallbackProbeTimer = setTimeout(() => {
+          this._fallbackProbeTimer = null;
+          if (this._state === STATE_WAIT_CLIENT_HELLO && !this._parser._chMatched && !this.destroyed) {
+            this._enterPreAuthFailure(new ProtocolError('Unrecognized pre-auth stream diverted to fallback', 'ERR_HANDSHAKE_AUTH'));
+          }
+        }, 30);
+        this._fallbackProbeTimer.unref?.();
       }
     };
 
     this._onRawError = (err) => {
-      if (!this.destroyed) {
+      if (!this.destroyed && this._state !== STATE_CLOSED) {
         if (this._localEofSent && this._remoteEofReceived) {
           this.destroy();
         } else {
-          this.destroy(err);
+          this.destroy(this._tarpitError || err);
         }
       }
     };
 
     this._onRawClose = () => {
       if (this.destroyed || this._state === STATE_CLOSED) return;
-      if (this._state !== STATE_OPEN) {
+      if (this._tarpitting) {
+        this.destroy(this._tarpitError || new ProtocolError('Connection closed during handshake', 'ERR_HANDSHAKE_ABORTED'));
+      } else if (this._state !== STATE_OPEN) {
         this.destroy(new ProtocolError('Connection closed before handshake completed', 'ERR_HANDSHAKE_ABORTED'));
       } else if (!this._remoteEofReceived) {
         this.destroy(new ProtocolError('Truncated stream: connection closed without authenticated EOF', 'ERR_TUNNEL_TRUNCATED'));
@@ -278,7 +418,17 @@ export class TunnelSocket extends Duplex {
     };
 
     this._onRawEnd = () => {
-      // Wait for close or verify EOF immediately if peer half-closed TCP without MSG_EOF
+      if (this._tarpitting) {
+        if (!this.destroyed && this._state !== STATE_CLOSED) {
+          this.destroy(this._tarpitError || new ProtocolError('Peer ended stream before handshake completed', 'ERR_HANDSHAKE_ABORTED'));
+        }
+        return;
+      }
+      // If server is awaiting CLIENT_HELLO and peer already sent < 1 slot + FIN (e.g. short probe) with fallback enabled
+      if (this.role === 'server' && this._state === STATE_WAIT_CLIENT_HELLO && this._onProbeFallback && this._preAuthChunks) {
+        this._enterPreAuthFailure(new ProtocolError('Short non-tunnel stream before CLIENT_HELLO', 'ERR_HANDSHAKE_ABORTED'));
+        return;
+      }
       if (!this.destroyed && this._state !== STATE_CLOSED && !this._remoteEofReceived) {
         const code = this._state === STATE_OPEN ? 'ERR_TUNNEL_TRUNCATED' : 'ERR_HANDSHAKE_ABORTED';
         const msg = this._state === STATE_OPEN
@@ -304,24 +454,42 @@ export class TunnelSocket extends Duplex {
     if (this.destroyed || this._state !== STATE_CLIENT_INIT) return;
     try {
       this._eph = generateEphemeralKeys();
+      this._shSeed = crypto.randomBytes(SH_SEED_SIZE);
       const cSalt = crypto.randomBytes(HANDSHAKE_NONCE_SIZE);
       const pad = crypto.randomBytes(crypto.randomInt(16, MAX_HANDSHAKE_PAD - 16));
-      const helloBody = Buffer.concat([this._eph.publicKeyRaw, pad]);
-      this._transcript.update(Buffer.concat([cSalt, helloBody]));
+
+      const serverSecrets = this._expectedServers
+        ? Array.from(this._expectedServers.values(), (entry) => entry.spkiDer)
+        : [UNPINNED_HANDSHAKE_KEY];
+
+      const encoded = encodeClientHelloFrame({
+        serverSecrets,
+        clientEphRaw: this._eph.publicKeyRaw,
+        pad,
+        cSalt,
+        shSeed: this._shSeed,
+      });
+
+      this._transcript.update(encoded.cSalt);
+      this._transcript.update(encoded.shSeed);
+      this._transcript.update(encoded.timestampBuf);
+      this._transcript.update(this._eph.publicKeyRaw);
+      this._transcript.update(encoded.pad);
 
       this._state = STATE_WAIT_SERVER_HELLO;
+      this._parser.setServerHelloSeed(Buffer.from(this._shSeed));
       this._lastActivityAt = Date.now();
-      this.rawSocket.write(encodeSaltedHandshakeFrame('ch', MSG_CLIENT_HELLO, helloBody, cSalt));
+      this.rawSocket.write(encoded.wireFrame);
     } catch (err) {
       this.destroy(err);
     }
   }
 
   _onFrame(type, payload, salt) {
-    if (this.destroyed) return;
+    if (this.destroyed || this._tarpitting) return;
     switch (this._state) {
       case STATE_WAIT_CLIENT_HELLO:
-        return this._handleClientHello(payload, salt);
+        return this._handleClientHello(payload);
       case STATE_WAIT_SERVER_HELLO:
         return this._handleServerHello(payload, salt);
       case STATE_WAIT_CLIENT_AUTH:
@@ -335,21 +503,48 @@ export class TunnelSocket extends Duplex {
     }
   }
 
-  _handleClientHello(payload, cSalt) {
-    if (payload.length < CLIENT_HELLO_SIZE || payload.length > CLIENT_HELLO_MAX_SIZE) {
-      throw new ProtocolError('Invalid CLIENT_HELLO size', 'ERR_HANDSHAKE_FORMAT');
-    }
-    const cEphRaw = payload.subarray(0, X25519_RAW_SIZE);
-    const cEphPub = importX25519RawPublicKey(cEphRaw);
-    this._transcript.update(Buffer.concat([cSalt, payload]));
+  _handleClientHello(hello) {
+    const { cSalt, shSeed, timestampBuf, timestampSec, cEphRaw, pad } = hello;
 
-    this._eph = generateEphemeralKeys();
+    // 1. Verify timestamp freshness before consulting/recording in replay cache
+    const nowSec = BigInt(Math.floor(Date.now() / 1000));
+    const skew = timestampSec >= nowSec ? timestampSec - nowSec : nowSec - timestampSec;
+    if (skew > BigInt(this._maxClockSkewSec)) {
+      throw new ProtocolError('Expired or future CLIENT_HELLO timestamp', 'ERR_HANDSHAKE_REPLAY');
+    }
+
+    // 2. Verify cSalt has never been used within the replay window (blocks VMess-style replay probing!)
+    if (!this._replayCache.checkAndRecord(cSalt)) {
+      throw new ProtocolError('Replayed CLIENT_HELLO detected', 'ERR_HANDSHAKE_REPLAY');
+    }
+
+    // 3. Validate client ephemeral X25519 key & compute shared secret BEFORE emitting any response
+    const cEphPub = importX25519RawPublicKey(cEphRaw);
+    const sEph = generateEphemeralKeys();
+    const rawShared = computeSharedSecret(sEph.privateKey, cEphPub);
+
+    this._preAuthChunks = null;
+    this._preAuthBytes = 0;
+    if (this._fallbackProbeTimer) {
+      clearTimeout(this._fallbackProbeTimer);
+      this._fallbackProbeTimer = null;
+    }
+    this._eph = sEph;
+    this._rawShared = rawShared;
+
+    this._transcript.update(cSalt);
+    this._transcript.update(shSeed);
+    this._transcript.update(timestampBuf);
+    this._transcript.update(cEphRaw);
+    this._transcript.update(pad);
+
     const sSalt = crypto.randomBytes(HANDSHAKE_NONCE_SIZE);
     const sPad = crypto.randomBytes(crypto.randomInt(16, MAX_HANDSHAKE_PAD - 16));
     const serverPlain = Buffer.concat([this._eph.publicKeyRaw, sPad]);
 
-    this._rawShared = computeSharedSecret(this._eph.privateKey, cEphPub);
-    this._transcript.update(Buffer.concat([sSalt, serverPlain]));
+    this._transcript.update(sSalt);
+    this._transcript.update(this._eph.publicKeyRaw);
+    this._transcript.update(sPad);
     const th1 = this._transcript.digest();
 
     const hsPair = deriveCipherPair(this._rawShared, th1, 'hs');
@@ -364,10 +559,13 @@ export class TunnelSocket extends Duplex {
     this._th2 = this._transcript.digest();
 
     const fullBody = Buffer.concat([serverPlain, encServerAuth]);
+    const wireSh = encodeServerHelloFrame(shSeed, fullBody, sSalt);
+    shSeed.fill(0);
+
     this._state = STATE_WAIT_CLIENT_AUTH;
     this._parser.setCipher(this._hsRecv);
     this._lastActivityAt = Date.now();
-    this.rawSocket.write(encodeSaltedHandshakeFrame('sh', MSG_SERVER_HELLO, fullBody, sSalt));
+    this.rawSocket.write(wireSh);
   }
 
   _handleServerHello(payload, sSalt) {
@@ -377,12 +575,15 @@ export class TunnelSocket extends Duplex {
     const encAuthLen = INNER_AUTH_SIZE + AEAD_TAG_SIZE;
     const serverPlain = payload.subarray(0, payload.length - encAuthLen);
     const sEphRaw = serverPlain.subarray(0, X25519_RAW_SIZE);
+    const sPad = serverPlain.subarray(X25519_RAW_SIZE);
     const encServerAuth = payload.subarray(payload.length - encAuthLen);
 
     const sEphPub = importX25519RawPublicKey(sEphRaw);
     this._rawShared = computeSharedSecret(this._eph.privateKey, sEphPub);
 
-    this._transcript.update(Buffer.concat([sSalt, serverPlain]));
+    this._transcript.update(sSalt);
+    this._transcript.update(sEphRaw);
+    this._transcript.update(sPad);
     const th1 = this._transcript.digest();
 
     const hsPair = deriveCipherPair(this._rawShared, th1, 'hs');
@@ -459,7 +660,6 @@ export class TunnelSocket extends Duplex {
     const clientSpkiDer = innerClientAuth.subarray(0, ED25519_SPKI_SIZE);
     const clientSig = innerClientAuth.subarray(ED25519_SPKI_SIZE, INNER_AUTH_SIZE);
 
-    // Ensure valid Ed25519 SPKI and check authorization
     const clientPubObj = importEd25519PublicKey(clientSpkiDer);
     const clientFp = computeFingerprint(clientSpkiDer);
     let clientComment = '';
@@ -517,6 +717,8 @@ export class TunnelSocket extends Duplex {
       clearTimeout(this._handshakeTimer);
       this._handshakeTimer = null;
     }
+    this._preAuthChunks = null;
+    this._preAuthBytes = 0;
     this._state = STATE_OPEN;
     this.authorized = true;
     this._startKeepAlive();
@@ -530,6 +732,10 @@ export class TunnelSocket extends Duplex {
   }
 
   _zeroHandshakeSecrets() {
+    if (this._shSeed) {
+      this._shSeed.fill(0);
+      this._shSeed = null;
+    }
     if (this._rawShared) {
       this._rawShared.fill(0);
       this._rawShared = null;
@@ -546,10 +752,10 @@ export class TunnelSocket extends Duplex {
     this._th2 = null;
   }
 
-  // --- Application Data & Control Frames ---
+  // --- Application Data (with Per-Hop Stochastic Padding) & Control Frames ---
 
   _handleOpenFrame(type, payload) {
-    if (this._remoteEofReceived && type === MSG_DATA) {
+    if (this._remoteEofReceived && (type === MSG_DATA || type === MSG_DATA_PAD)) {
       throw new ProtocolError('Received DATA frame after EOF', 'ERR_DATA_AFTER_EOF');
     }
 
@@ -559,6 +765,25 @@ export class TunnelSocket extends Duplex {
       case MSG_DATA: {
         if (plaintext.length === 0) return;
         const canPushMore = this.push(plaintext);
+        if (!canPushMore) {
+          this.rawSocket.pause();
+        }
+        break;
+      }
+      case MSG_DATA_PAD: {
+        if (plaintext.length < 1) {
+          throw new ProtocolError('Malformed MSG_DATA_PAD frame', 'ERR_DECRYPT_FAILED');
+        }
+        const padLen = plaintext[0];
+        if (1 + padLen > plaintext.length) {
+          throw new ProtocolError('Invalid MSG_DATA_PAD padding length', 'ERR_DECRYPT_FAILED');
+        }
+        if (1 + padLen === plaintext.length) {
+          // Pure chaff / cover-traffic frame with 0 data bytes
+          return;
+        }
+        const realData = plaintext.subarray(1, plaintext.length - padLen);
+        const canPushMore = this.push(realData);
         if (!canPushMore) {
           this.rawSocket.pause();
         }
@@ -577,10 +802,24 @@ export class TunnelSocket extends Duplex {
         break;
       }
       case MSG_PING: {
-        if (!this._localEofSent && this.rawSocket.writable) {
-          // Independent random PONG size (defeats PING == PONG echo length/RTT oracle!)
-          const pongPad = crypto.randomBytes(crypto.randomInt(8, 97));
-          this._sendEncryptedFrame(MSG_PONG, pongPad);
+        if (!this._localEofSent && this.rawSocket.writable && !this._pongSendDelayTimer) {
+          // Jitter both PONG size and PONG reply delay (5..60ms, bounded by 25% of timeout) to mask idle RTT!
+          const maxJitter = Math.min(60, Math.max(2, Math.floor((this._keepAliveTimeoutMs || 10_000) * 0.25)));
+          const minJitter = Math.min(5, Math.max(1, maxJitter - 1));
+          const delayMs = maxJitter > minJitter ? crypto.randomInt(minJitter, maxJitter + 1) : minJitter;
+
+          this._pongSendDelayTimer = setTimeout(() => {
+            this._pongSendDelayTimer = null;
+            if (this._state === STATE_OPEN && !this.destroyed && !this._localEofSent && this.rawSocket.writable) {
+              try {
+                const pongPad = crypto.randomBytes(crypto.randomInt(8, 97));
+                this._sendEncryptedFrame(MSG_PONG, pongPad);
+              } catch (err) {
+                this.destroy(err);
+              }
+            }
+          }, delayMs);
+          this._pongSendDelayTimer.unref?.();
         }
         break;
       }
@@ -607,7 +846,6 @@ export class TunnelSocket extends Duplex {
           }
         }
 
-        // Ratchet incoming cipher immediately; all subsequent frames use new epoch key
         this._recvCipher.ratchet();
         this.recvEpoch = this._recvCipher.epoch;
 
@@ -642,13 +880,40 @@ export class TunnelSocket extends Duplex {
     this.emit('rekey', { direction: 'send', sendEpoch: this.sendEpoch, recvEpoch: this.recvEpoch });
   }
 
-  _sendEncryptedFrame(type, plaintext) {
+  _sendDataSlice(slice) {
+    let frameType = MSG_DATA;
+    let body = slice;
+
+    if (this._trafficPadding) {
+      let padLen = 0;
+      if (slice.length < SMALL_FRAME_PAD_THRESHOLD) {
+        // Erases 112B/124B TUN TCP-ACK spikes, 200B MUX_OPEN constants & Relay cross-leg size correlation
+        padLen = crypto.randomInt(1, 65);
+      } else if (slice.length <= MTU_FRAME_PAD_THRESHOLD) {
+        // Smears 1280B QUIC / 1320B TUN MTU peaks while staying safely below 1440B PPPoE/Ethernet MSS across 3 hops
+        padLen = crypto.randomInt(0, 13);
+      }
+
+      if (padLen > 0) {
+        frameType = MSG_DATA_PAD;
+        const padded = Buffer.allocUnsafe(1 + slice.length + padLen);
+        padded[0] = padLen;
+        slice.copy(padded, 1);
+        crypto.randomFillSync(padded, 1 + slice.length, padLen);
+        body = padded;
+      }
+    }
+
+    return this._sendEncryptedFrame(frameType, body, slice.length);
+  }
+
+  _sendEncryptedFrame(type, plaintext, accountedDataBytes = plaintext.length) {
     const rawFrame = this._sendCipher.encryptFrame(type, plaintext);
     this._lastActivityAt = Date.now();
     const ok = this.rawSocket.write(rawFrame);
 
-    if (type === MSG_DATA) {
-      this._bytesSinceRekey += plaintext.length;
+    if (type === MSG_DATA || type === MSG_DATA_PAD) {
+      this._bytesSinceRekey += accountedDataBytes;
       if (
         this._rekeyAfterBytes > 0 &&
         this._bytesSinceRekey >= this._rekeyAfterBytes &&
@@ -699,7 +964,6 @@ export class TunnelSocket extends Duplex {
         return;
       }
 
-      // Only transmit MSG_PING when channel has genuinely been idle (no live data traffic)
       const idleMs = Date.now() - this._lastActivityAt;
       if (idleMs < jitteredDelay * 0.75) {
         this._scheduleIdlePing();
@@ -767,6 +1031,10 @@ export class TunnelSocket extends Duplex {
       clearTimeout(this._pongTimer);
       this._pongTimer = null;
     }
+    if (this._pongSendDelayTimer) {
+      clearTimeout(this._pongSendDelayTimer);
+      this._pongSendDelayTimer = null;
+    }
     if (this._rekeyInterval) {
       clearInterval(this._rekeyInterval);
       this._rekeyInterval = null;
@@ -796,7 +1064,7 @@ export class TunnelSocket extends Duplex {
       let canContinue = true;
       for (let offset = 0; offset < buf.length; offset += MAX_PLAINTEXT_SIZE) {
         const slice = buf.subarray(offset, offset + MAX_PLAINTEXT_SIZE);
-        canContinue = this._sendEncryptedFrame(MSG_DATA, slice);
+        canContinue = this._sendDataSlice(slice);
       }
       if (canContinue) {
         callback();
@@ -856,12 +1124,18 @@ export class TunnelSocket extends Duplex {
   _destroy(err, callback) {
     this._state = STATE_CLOSED;
     this._pendingPostHandshake = null;
+    this._preAuthChunks = null;
+    this._preAuthBytes = 0;
     if (this._cancelDrainWait) {
       this._cancelDrainWait();
     }
     if (this._handshakeTimer) {
       clearTimeout(this._handshakeTimer);
       this._handshakeTimer = null;
+    }
+    if (this._fallbackProbeTimer) {
+      clearTimeout(this._fallbackProbeTimer);
+      this._fallbackProbeTimer = null;
     }
     this._stopKeepAlive();
     this._parser.stop();
@@ -895,11 +1169,13 @@ export class TunnelServer extends EventEmitter {
       throw new TypeError('createServer requires "authorizedKeys", "authorizeClient", or "allowAnyClient"');
     }
 
-    // Pre-validate server key & authorizedKeys at startup
     this._identity = loadPrivateKey(options.key);
     this._authorizedKeys = options.authorizedKeys ? loadAuthorizedKeys(options.authorizedKeys) : null;
     this._options = options;
     this._unixSocketPath = null;
+    this._replayCache = options.replayCache || new ReplayCache({
+      windowMs: (options.maxClockSkewSec ?? DEFAULT_MAX_CLOCK_SKEW_SEC) * 2000,
+    });
     this._transportConfig = {
       protocol: options.protocol || (options.tlsCert ? 'tls' : 'tcp'),
       wsPath: options.wsPath || '/ws',
@@ -913,12 +1189,22 @@ export class TunnelServer extends EventEmitter {
     }
 
     this.netServer = createTransportServer(this._transportConfig, (rawSocket) => {
+      const isWs = this._transportConfig.protocol === 'ws' || this._transportConfig.protocol === 'wss';
+      const fallbackTarget = !isWs && this._transportConfig.fallback ? this._transportConfig.fallback : null;
+
       const tunnel = new TunnelSocket(rawSocket, {
         role: 'server',
         key: this._identity,
         authorizedKeys: this._authorizedKeys,
         allowAnyClient: options.allowAnyClient,
         authorizeClient: options.authorizeClient,
+        allowUnpinnedClientHello: options.allowUnpinnedClientHello ?? false,
+        replayCache: this._replayCache,
+        maxClockSkewSec: options.maxClockSkewSec,
+        trafficPadding: options.trafficPadding ?? true,
+        onProbeFallback: fallbackTarget
+          ? (sock, captured) => handleProbeFallback(sock, captured, fallbackTarget)
+          : null,
         allowHalfOpen: options.allowHalfOpen ?? true,
         handshakeTimeoutMs: options.handshakeTimeoutMs,
         keepAliveMs: options.keepAliveMs,
@@ -932,9 +1218,12 @@ export class TunnelServer extends EventEmitter {
       };
 
       tunnel.once('error', onPreHandshakeError);
+      tunnel.once('probeFallback', (err) => {
+        tunnel.off('error', onPreHandshakeError);
+        this.emit('clientError', err, rawSocket);
+      });
       tunnel.once('secureConnection', () => {
         tunnel.off('error', onPreHandshakeError);
-        // Permanent fallback guard so removing temporary error listeners never crashes the server
         tunnel.on('error', (err) => {
           if (tunnel.listenerCount('error') === 1) {
             this.emit('clientError', err, rawSocket);
@@ -964,7 +1253,6 @@ export class TunnelServer extends EventEmitter {
     if (args.length >= 1 && (typeof args[0] === 'string' || (typeof args[0] === 'object' && args[0] !== null && !Array.isArray(args[0])))) {
       const first = args[0];
       const cb = typeof args[1] === 'function' ? args[1] : undefined;
-      // Support endpoint string like ":5001" (dual-stack), "127.0.0.1:5001", "unix:/tmp/x.sock", "/tmp/x.sock"
       if (typeof first === 'string') {
         const ep = parseEndpoint(first, '');
         if (ep.protocol) this._transportConfig.protocol = ep.protocol;
@@ -1034,6 +1322,7 @@ export function connect(options, connectListener) {
     serverPublicKey: connectOpts.serverPublicKey,
     allowAnyServer: connectOpts.allowAnyServer,
     verifyServer: connectOpts.verifyServer,
+    trafficPadding: connectOpts.trafficPadding ?? true,
     allowHalfOpen: connectOpts.allowHalfOpen ?? true,
     handshakeTimeoutMs: connectOpts.handshakeTimeoutMs,
     keepAliveMs: connectOpts.keepAliveMs,
@@ -1067,6 +1356,7 @@ import { MuxSession, MuxStream } from './mux.mjs';
 export {
   MuxSession,
   MuxStream,
+  ReplayCache,
   generateIdentity,
   loadPrivateKey,
   loadPublicKey,
