@@ -30,16 +30,18 @@ import {
   SERVER_READY_MAX_SIZE,
   SERVER_READY_SIZE,
   Transcript,
+  X25519_RAW_SIZE,
   X25519_SPKI_SIZE,
   computeFingerprint,
   computeSharedSecret,
   defaultMaxFrameSize,
   deriveCipherPair,
-  encodeFrame,
+  encodeSaltedHandshakeFrame,
   generateEphemeralKeys,
   generateIdentity,
   importEd25519PublicKey,
   importX25519PublicKey,
+  importX25519RawPublicKey,
   loadAuthorizedKeys,
   loadPrivateKey,
   loadPublicKey,
@@ -175,6 +177,7 @@ export class TunnelSocket extends Duplex {
     this._pongTimer = null;
     this._keepAliveMs = keepAliveMs;
     this._keepAliveTimeoutMs = keepAliveTimeoutMs;
+    this._lastActivityAt = Date.now();
 
     this._rekeyAfterBytes = rekeyAfterBytes;
     this._rekeyIntervalMs = rekeyIntervalMs;
@@ -184,8 +187,9 @@ export class TunnelSocket extends Duplex {
     this._rekeyCountInWindow = 0;
 
     this._parser = new FrameParser(
-      (type, payload) => this._onFrame(type, payload),
+      (type, payload, salt) => this._onFrame(type, payload, salt),
       (type) => this._maxAllowedPayload(type),
+      role === 'client' ? 'salted-sh' : 'salted-ch',
     );
 
     this._bindRawSocket();
@@ -300,25 +304,26 @@ export class TunnelSocket extends Duplex {
     if (this.destroyed || this._state !== STATE_CLIENT_INIT) return;
     try {
       this._eph = generateEphemeralKeys();
-      const cNonce = crypto.randomBytes(HANDSHAKE_NONCE_SIZE);
+      const cSalt = crypto.randomBytes(HANDSHAKE_NONCE_SIZE);
       const pad = crypto.randomBytes(crypto.randomInt(16, MAX_HANDSHAKE_PAD - 16));
-      const helloPayload = Buffer.concat([cNonce, this._eph.publicKeyDer, pad]);
-      this._transcript.update(helloPayload);
+      const helloBody = Buffer.concat([this._eph.publicKeyRaw, pad]);
+      this._transcript.update(Buffer.concat([cSalt, helloBody]));
 
       this._state = STATE_WAIT_SERVER_HELLO;
-      this.rawSocket.write(encodeFrame(MSG_CLIENT_HELLO, helloPayload));
+      this._lastActivityAt = Date.now();
+      this.rawSocket.write(encodeSaltedHandshakeFrame('ch', MSG_CLIENT_HELLO, helloBody, cSalt));
     } catch (err) {
       this.destroy(err);
     }
   }
 
-  _onFrame(type, payload) {
+  _onFrame(type, payload, salt) {
     if (this.destroyed) return;
     switch (this._state) {
       case STATE_WAIT_CLIENT_HELLO:
-        return this._handleClientHello(payload);
+        return this._handleClientHello(payload, salt);
       case STATE_WAIT_SERVER_HELLO:
-        return this._handleServerHello(payload);
+        return this._handleServerHello(payload, salt);
       case STATE_WAIT_CLIENT_AUTH:
         return this._handleClientAuth(payload);
       case STATE_WAIT_SERVER_READY:
@@ -330,21 +335,21 @@ export class TunnelSocket extends Duplex {
     }
   }
 
-  _handleClientHello(payload) {
+  _handleClientHello(payload, cSalt) {
     if (payload.length < CLIENT_HELLO_SIZE || payload.length > CLIENT_HELLO_MAX_SIZE) {
       throw new ProtocolError('Invalid CLIENT_HELLO size', 'ERR_HANDSHAKE_FORMAT');
     }
-    const cEphDer = payload.subarray(HANDSHAKE_NONCE_SIZE, CLIENT_HELLO_SIZE);
-    const cEphPub = importX25519PublicKey(cEphDer);
-    this._transcript.update(payload);
+    const cEphRaw = payload.subarray(0, X25519_RAW_SIZE);
+    const cEphPub = importX25519RawPublicKey(cEphRaw);
+    this._transcript.update(Buffer.concat([cSalt, payload]));
 
     this._eph = generateEphemeralKeys();
-    const sNonce = crypto.randomBytes(HANDSHAKE_NONCE_SIZE);
+    const sSalt = crypto.randomBytes(HANDSHAKE_NONCE_SIZE);
     const sPad = crypto.randomBytes(crypto.randomInt(16, MAX_HANDSHAKE_PAD - 16));
-    const serverPlain = Buffer.concat([sNonce, this._eph.publicKeyDer, sPad]);
+    const serverPlain = Buffer.concat([this._eph.publicKeyRaw, sPad]);
 
     this._rawShared = computeSharedSecret(this._eph.privateKey, cEphPub);
-    this._transcript.update(serverPlain);
+    this._transcript.update(Buffer.concat([sSalt, serverPlain]));
     const th1 = this._transcript.digest();
 
     const hsPair = deriveCipherPair(this._rawShared, th1, 'hs');
@@ -358,24 +363,26 @@ export class TunnelSocket extends Duplex {
     this._transcript.update(innerServerAuth);
     this._th2 = this._transcript.digest();
 
-    const fullPayload = Buffer.concat([serverPlain, encServerAuth]);
+    const fullBody = Buffer.concat([serverPlain, encServerAuth]);
     this._state = STATE_WAIT_CLIENT_AUTH;
-    this.rawSocket.write(encodeFrame(MSG_SERVER_HELLO, fullPayload));
+    this._parser.setCipher(this._hsRecv);
+    this._lastActivityAt = Date.now();
+    this.rawSocket.write(encodeSaltedHandshakeFrame('sh', MSG_SERVER_HELLO, fullBody, sSalt));
   }
 
-  _handleServerHello(payload) {
+  _handleServerHello(payload, sSalt) {
     if (payload.length < SERVER_HELLO_SIZE || payload.length > SERVER_HELLO_MAX_SIZE) {
       throw new ProtocolError('Invalid SERVER_HELLO size', 'ERR_HANDSHAKE_FORMAT');
     }
     const encAuthLen = INNER_AUTH_SIZE + AEAD_TAG_SIZE;
     const serverPlain = payload.subarray(0, payload.length - encAuthLen);
-    const sEphDer = serverPlain.subarray(HANDSHAKE_NONCE_SIZE, HANDSHAKE_NONCE_SIZE + X25519_SPKI_SIZE);
+    const sEphRaw = serverPlain.subarray(0, X25519_RAW_SIZE);
     const encServerAuth = payload.subarray(payload.length - encAuthLen);
 
-    const sEphPub = importX25519PublicKey(sEphDer);
+    const sEphPub = importX25519RawPublicKey(sEphRaw);
     this._rawShared = computeSharedSecret(this._eph.privateKey, sEphPub);
 
-    this._transcript.update(serverPlain);
+    this._transcript.update(Buffer.concat([sSalt, serverPlain]));
     const th1 = this._transcript.digest();
 
     const hsPair = deriveCipherPair(this._rawShared, th1, 'hs');
@@ -425,7 +432,7 @@ export class TunnelSocket extends Duplex {
     const clientSig = signClientTranscript(th2, this._identity.spkiDer, this._identity.privateKey);
     const cAuthPad = crypto.randomBytes(crypto.randomInt(16, MAX_HANDSHAKE_PAD - 16));
     const innerClientAuth = Buffer.concat([this._identity.spkiDer, clientSig, cAuthPad]);
-    const encClientAuth = this._hsSend.encrypt(MSG_CLIENT_AUTH, innerClientAuth);
+    const encClientAuthFrame = this._hsSend.encryptFrame(MSG_CLIENT_AUTH, innerClientAuth);
 
     this._transcript.update(innerClientAuth);
     const th3 = this._transcript.digest();
@@ -435,7 +442,9 @@ export class TunnelSocket extends Duplex {
     this._zeroHandshakeSecrets();
 
     this._state = STATE_WAIT_SERVER_READY;
-    this.rawSocket.write(encodeFrame(MSG_CLIENT_AUTH, encClientAuth));
+    this._parser.setCipher(this._recvCipher);
+    this._lastActivityAt = Date.now();
+    this.rawSocket.write(encClientAuthFrame);
   }
 
   _handleClientAuth(payload) {
@@ -486,9 +495,11 @@ export class TunnelSocket extends Duplex {
     this._recvCipher = appPair.c2s;
     this._zeroHandshakeSecrets();
 
+    this._parser.setCipher(this._recvCipher);
     const readyPad = crypto.randomBytes(crypto.randomInt(16, MAX_HANDSHAKE_PAD - 16));
-    const readyPayload = this._sendCipher.encrypt(MSG_SERVER_READY, readyPad);
-    this.rawSocket.write(encodeFrame(MSG_SERVER_READY, readyPayload));
+    const readyFrame = this._sendCipher.encryptFrame(MSG_SERVER_READY, readyPad);
+    this._lastActivityAt = Date.now();
+    this.rawSocket.write(readyFrame);
 
     this._completeHandshake('secureConnection');
   }
@@ -567,7 +578,9 @@ export class TunnelSocket extends Duplex {
       }
       case MSG_PING: {
         if (!this._localEofSent && this.rawSocket.writable) {
-          this._sendEncryptedFrame(MSG_PONG, plaintext);
+          // Independent random PONG size (defeats PING == PONG echo length/RTT oracle!)
+          const pongPad = crypto.randomBytes(crypto.randomInt(8, 97));
+          this._sendEncryptedFrame(MSG_PONG, pongPad);
         }
         break;
       }
@@ -619,8 +632,9 @@ export class TunnelSocket extends Duplex {
 
   _performSendRekey(requestPeerUpdate) {
     const flagBuf = Buffer.from([requestPeerUpdate ? 1 : 0]);
-    const encrypted = this._sendCipher.encrypt(MSG_REKEY, flagBuf);
-    this.rawSocket.write(encodeFrame(MSG_REKEY, encrypted));
+    const rawFrame = this._sendCipher.encryptFrame(MSG_REKEY, flagBuf);
+    this._lastActivityAt = Date.now();
+    this.rawSocket.write(rawFrame);
 
     this._sendCipher.ratchet();
     this.sendEpoch = this._sendCipher.epoch;
@@ -629,8 +643,9 @@ export class TunnelSocket extends Duplex {
   }
 
   _sendEncryptedFrame(type, plaintext) {
-    const encrypted = this._sendCipher.encrypt(type, plaintext);
-    const ok = this.rawSocket.write(encodeFrame(type, encrypted));
+    const rawFrame = this._sendCipher.encryptFrame(type, plaintext);
+    this._lastActivityAt = Date.now();
+    const ok = this.rawSocket.write(rawFrame);
 
     if (type === MSG_DATA) {
       this._bytesSinceRekey += plaintext.length;
@@ -653,7 +668,63 @@ export class TunnelSocket extends Duplex {
     }
   }
 
-  // --- Keepalive ---
+  // --- Keepalive (idle-only, jittered, non-echoing) ---
+
+  setKeepAlive(intervalMs) {
+    this._keepAliveMs = Number(intervalMs) || 0;
+    if (this._keepAliveInterval) {
+      clearTimeout(this._keepAliveInterval);
+      this._keepAliveInterval = null;
+    }
+    if (this._pongTimer) {
+      clearTimeout(this._pongTimer);
+      this._pongTimer = null;
+    }
+    if (this._keepAliveMs > 0 && this._state === STATE_OPEN && !this.destroyed) {
+      this._scheduleIdlePing();
+    }
+  }
+
+  _scheduleIdlePing() {
+    if (this._state !== STATE_OPEN || this.destroyed || !this._keepAliveMs || this._keepAliveMs <= 0) return;
+    const jitteredDelay = Math.max(10, Math.round(this._keepAliveMs * (0.75 + Math.random() * 0.5)));
+    this._keepAliveInterval = setTimeout(() => {
+      if (
+        this._state !== STATE_OPEN ||
+        this.destroyed ||
+        this._localEofSent ||
+        this._remoteEofReceived ||
+        !this.rawSocket.writable
+      ) {
+        return;
+      }
+
+      // Only transmit MSG_PING when channel has genuinely been idle (no live data traffic)
+      const idleMs = Date.now() - this._lastActivityAt;
+      if (idleMs < jitteredDelay * 0.75) {
+        this._scheduleIdlePing();
+        return;
+      }
+
+      if (!this._pongTimer) {
+        try {
+          const pingNoise = crypto.randomBytes(crypto.randomInt(8, 97));
+          this._sendEncryptedFrame(MSG_PING, pingNoise);
+          this._pongTimer = setTimeout(() => {
+            if (!this.destroyed && this._state === STATE_OPEN) {
+              this.destroy(new ProtocolError('Keepalive timeout', 'ERR_KEEPALIVE_TIMEOUT'));
+            }
+          }, this._keepAliveTimeoutMs);
+          this._pongTimer.unref?.();
+        } catch (err) {
+          this.destroy(err);
+          return;
+        }
+      }
+      this._scheduleIdlePing();
+    }, jitteredDelay);
+    this._keepAliveInterval.unref?.();
+  }
 
   _startKeepAlive() {
     if (this.role === 'client' && this._rekeyIntervalMs > 0) {
@@ -676,42 +747,11 @@ export class TunnelSocket extends Duplex {
     }
 
     if (!this._keepAliveMs || this._keepAliveMs <= 0) return;
-    const scheduleNextPing = () => {
-      if (this._state !== STATE_OPEN || this.destroyed) return;
-      const jitteredDelay = Math.max(10, Math.round(this._keepAliveMs * (0.75 + Math.random() * 0.5)));
-      this._keepAliveInterval = setTimeout(() => {
-        if (
-          this._state !== STATE_OPEN ||
-          this.destroyed ||
-          this._localEofSent ||
-          this._remoteEofReceived ||
-          !this.rawSocket.writable
-        ) {
-          return;
-        }
-        if (!this._pongTimer) {
-          try {
-            const pingNoise = crypto.randomBytes(crypto.randomInt(8, 57));
-            this._sendEncryptedFrame(MSG_PING, pingNoise);
-            this._pongTimer = setTimeout(() => {
-              if (!this.destroyed && this._state === STATE_OPEN) {
-                this.destroy(new ProtocolError('Keepalive timeout', 'ERR_KEEPALIVE_TIMEOUT'));
-              }
-            }, this._keepAliveTimeoutMs);
-            this._pongTimer.unref?.();
-          } catch (err) {
-            this.destroy(err);
-            return;
-          }
-        }
-        scheduleNextPing();
-      }, jitteredDelay);
-      this._keepAliveInterval.unref?.();
-    };
-    scheduleNextPing();
+    this._scheduleIdlePing();
   }
 
   _resetKeepAliveActivity() {
+    this._lastActivityAt = Date.now();
     if (this._pongTimer) {
       clearTimeout(this._pongTimer);
       this._pongTimer = null;

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { Duplex } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { ProtocolError } from './crypto.mjs';
@@ -14,10 +15,39 @@ export const MUX_DGRAM = 0x08;
 export const MUX_GOAWAY = 0x09;
 
 export const MUX_HEADER_SIZE = 9; // [type:1][streamId:4 BE][length:4 BE]
-export const MAX_MUX_CHUNK = 32768; // 32 KiB (fits cleanly inside 64 KiB TunnelSocket frame)
+// 16 KiB max data chunk guarantees multi-hop Onion + Mux frames never split across 32 KiB WebSocket chunks
+export const MAX_MUX_CHUNK = 16384;
 export const MAX_MUX_META = 4096;
+const MAX_MUX_META_WIRE = MAX_MUX_META + 256;
+const META_BUCKET_BYTES = 128; // Quantize MUX_OPEN metadata into 128B buckets so host lengths never leak
 export const INITIAL_STREAM_WINDOW = 262144; // 256 KiB per stream
 const WINDOW_UPDATE_THRESHOLD = 131072; // 128 KiB
+
+function packPaddedMeta(rawBuf, bucketAlign = false) {
+  const realLen = rawBuf.length;
+  let totalLen;
+  if (bucketAlign) {
+    totalLen = Math.max(META_BUCKET_BYTES, Math.ceil((2 + realLen + 8) / META_BUCKET_BYTES) * META_BUCKET_BYTES);
+  } else {
+    totalLen = 2 + realLen + crypto.randomInt(8, 49);
+  }
+  const out = Buffer.allocUnsafe(totalLen);
+  out.writeUInt16BE(realLen, 0);
+  if (realLen > 0) rawBuf.copy(out, 2);
+  crypto.randomFillSync(out, 2 + realLen, totalLen - (2 + realLen));
+  return out;
+}
+
+function unpackPaddedMeta(wireBuf) {
+  if (wireBuf.length < 2) {
+    throw new ProtocolError('Malformed padded mux metadata', 'ERR_MUX_PROTOCOL');
+  }
+  const realLen = wireBuf.readUInt16BE(0);
+  if (2 + realLen > wireBuf.length) {
+    throw new ProtocolError('Truncated padded mux metadata', 'ERR_MUX_PROTOCOL');
+  }
+  return wireBuf.subarray(2, 2 + realLen);
+}
 
 export function encodeMuxFrame(type, streamId, payload = Buffer.alloc(0)) {
   const frame = Buffer.allocUnsafe(MUX_HEADER_SIZE + payload.length);
@@ -36,15 +66,14 @@ function maxMuxPayloadSize(type) {
     case MUX_OPEN_OK:
     case MUX_OPEN_ERR:
     case MUX_RST:
-      return MAX_MUX_META;
+      return MAX_MUX_META_WIRE;
     case MUX_DATA:
     case MUX_DGRAM:
-      return MAX_MUX_CHUNK * 2; // allow up to 64 KiB datagrams/IP packets
+      return 65536; // allow up to 64 KiB datagrams/IP packets
     case MUX_WINDOW:
-      return 4;
     case MUX_EOF:
     case MUX_GOAWAY:
-      return 0;
+      return 64; // randomized control-frame padding (eliminates fixed 72B / 76B beacons)
     default:
       return -1;
   }
@@ -217,8 +246,10 @@ export class MuxStream extends Duplex {
       const delta = this._unackedBytes;
       this._unackedBytes = 0;
       this._recvInFlight -= delta;
-      const winBuf = Buffer.allocUnsafe(4);
+      const padLen = crypto.randomInt(8, 45);
+      const winBuf = Buffer.allocUnsafe(4 + padLen);
       winBuf.writeUInt32BE(delta >>> 0, 0);
+      crypto.randomFillSync(winBuf, 4, padLen);
       this.session._writeFrame(MUX_WINDOW, this.id, winBuf);
     }
   }
@@ -280,7 +311,7 @@ export class MuxStream extends Duplex {
       return;
     }
     this._localEofSent = true;
-    this.session._writeFrame(MUX_EOF, this.id);
+    this.session._writeFrame(MUX_EOF, this.id, crypto.randomBytes(crypto.randomInt(8, 49)));
     this._maybeCompleteCleanly();
     callback();
   }
@@ -298,7 +329,7 @@ export class MuxStream extends Duplex {
     if (!cleanlyDone && !this._rstReceived && !this.session.isClosed) {
       const msg = err?.message ? Buffer.from(String(err.message).slice(0, 256), 'utf8') : Buffer.alloc(0);
       try {
-        this.session._writeFrame(MUX_RST, this.id, msg);
+        this.session._writeFrame(MUX_RST, this.id, packPaddedMeta(msg, false));
       } catch {
         // Ignore carrier write errors during teardown
       }
@@ -436,7 +467,7 @@ export class MuxSession extends EventEmitter {
         this._pendingOpens.delete(streamId);
         this._streams.delete(streamId);
         try {
-          this._writeFrame(MUX_RST, streamId, Buffer.from('Open timeout'));
+          this._writeFrame(MUX_RST, streamId, packPaddedMeta(Buffer.from('Open timeout'), false));
         } catch {}
         reject(new ProtocolError('Timed out waiting for MUX_OPEN_OK', 'ERR_MUX_OPEN_TIMEOUT'));
       }, timeoutMs);
@@ -444,7 +475,7 @@ export class MuxSession extends EventEmitter {
 
       this._pendingOpens.set(streamId, { stream, resolve, reject, timer });
       this._streams.set(streamId, stream);
-      this._writeFrame(MUX_OPEN, streamId, metaBuf);
+      this._writeFrame(MUX_OPEN, streamId, packPaddedMeta(metaBuf, true));
     });
   }
 
@@ -460,10 +491,11 @@ export class MuxSession extends EventEmitter {
     switch (type) {
       case MUX_OPEN: {
         if (streamId === 0 || this._streams.has(streamId)) {
-          this._writeFrame(MUX_OPEN_ERR, streamId, Buffer.from('Invalid or duplicate streamId'));
+          this._writeFrame(MUX_OPEN_ERR, streamId, packPaddedMeta(Buffer.from('Invalid or duplicate streamId'), false));
           return;
         }
-        const stream = new MuxStream(this, streamId, payload);
+        const metaPayload = unpackPaddedMeta(payload);
+        const stream = new MuxStream(this, streamId, metaPayload);
         stream.on('error', () => {});
         this._streams.set(streamId, stream);
 
@@ -472,7 +504,7 @@ export class MuxSession extends EventEmitter {
           if (settled || this.isClosed) return;
           settled = true;
           const respBuf = Buffer.isBuffer(respMeta) ? respMeta : Buffer.from(String(respMeta), 'utf8');
-          this._writeFrame(MUX_OPEN_OK, streamId, respBuf);
+          this._writeFrame(MUX_OPEN_OK, streamId, packPaddedMeta(respBuf, false));
         };
         const reject = (reason = 'Stream rejected') => {
           if (settled || this.isClosed) return;
@@ -480,17 +512,17 @@ export class MuxSession extends EventEmitter {
           stream._rstReceived = true;
           this._streams.delete(streamId);
           const errText = typeof reason === 'string' ? reason : (reason?.message || 'Stream rejected');
-          this._writeFrame(MUX_OPEN_ERR, streamId, Buffer.from(errText.slice(0, 500), 'utf8'));
+          this._writeFrame(MUX_OPEN_ERR, streamId, packPaddedMeta(Buffer.from(errText.slice(0, 500), 'utf8'), false));
           stream.destroy();
         };
 
         if (typeof this._onStreamCallback === 'function') {
-          Promise.resolve(this._onStreamCallback(stream, payload, accept, reject)).catch((err) => {
+          Promise.resolve(this._onStreamCallback(stream, metaPayload, accept, reject)).catch((err) => {
             reject(err?.message || 'Unhandled stream handler error');
           });
         } else if (this.listenerCount('stream') > 0) {
           accept();
-          this.emit('stream', stream, payload);
+          this.emit('stream', stream, metaPayload);
         } else {
           reject('No stream handler registered');
         }
@@ -502,7 +534,7 @@ export class MuxSession extends EventEmitter {
         if (!pending) return;
         clearTimeout(pending.timer);
         this._pendingOpens.delete(streamId);
-        pending.stream.responseMetadata = payload;
+        pending.stream.responseMetadata = unpackPaddedMeta(payload);
         pending.resolve(pending.stream);
         break;
       }
@@ -515,7 +547,7 @@ export class MuxSession extends EventEmitter {
         pending.stream._rstReceived = true;
         this._streams.delete(streamId);
         pending.stream.destroy();
-        const reason = payload.toString('utf8') || 'Remote peer rejected stream';
+        const reason = unpackPaddedMeta(payload).toString('utf8') || 'Remote peer rejected stream';
         pending.reject(new ProtocolError(reason, 'ERR_MUX_OPEN_REJECTED'));
         break;
       }
@@ -523,7 +555,7 @@ export class MuxSession extends EventEmitter {
       case MUX_DATA: {
         const stream = this._streams.get(streamId);
         if (!stream) {
-          this._writeFrame(MUX_RST, streamId, Buffer.from('Unknown stream'));
+          this._writeFrame(MUX_RST, streamId, packPaddedMeta(Buffer.from('Unknown stream'), false));
           return;
         }
         if (payload.length > 0) {
@@ -533,7 +565,7 @@ export class MuxSession extends EventEmitter {
       }
 
       case MUX_WINDOW: {
-        if (payload.length !== 4) {
+        if (payload.length < 4) {
           throw new ProtocolError('Invalid MUX_WINDOW payload size', 'ERR_MUX_PROTOCOL');
         }
         const stream = this._streams.get(streamId);
@@ -552,6 +584,7 @@ export class MuxSession extends EventEmitter {
       }
 
       case MUX_RST: {
+        const errText = unpackPaddedMeta(payload).toString('utf8');
         const pending = this._pendingOpens.get(streamId);
         if (pending) {
           clearTimeout(pending.timer);
@@ -559,12 +592,12 @@ export class MuxSession extends EventEmitter {
           pending.stream._rstReceived = true;
           this._streams.delete(streamId);
           pending.stream.destroy();
-          pending.reject(new ProtocolError(payload.toString('utf8') || 'Stream reset during open', 'ERR_MUX_STREAM_RESET'));
+          pending.reject(new ProtocolError(errText || 'Stream reset during open', 'ERR_MUX_STREAM_RESET'));
           return;
         }
         const stream = this._streams.get(streamId);
         if (stream) {
-          stream._onRst(payload.toString('utf8'));
+          stream._onRst(errText);
         }
         break;
       }
@@ -629,7 +662,7 @@ export class MuxSession extends EventEmitter {
     this.goawayReceived = true;
     try {
       if (!this.carrier.destroyed && !this.carrier.writableEnded) {
-        this._writeFrame(MUX_GOAWAY, 0);
+        this._writeFrame(MUX_GOAWAY, 0, crypto.randomBytes(crypto.randomInt(8, 33)));
         this.carrier.end();
       }
     } catch {

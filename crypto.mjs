@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 
-export const PROTOCOL_ID = Buffer.from('socket-tunnel-v1', 'utf8');
+export const PROTOCOL_ID = Buffer.from('socket-tunnel-v2', 'utf8');
 
 // Frame types
 export const MSG_CLIENT_HELLO = 0x01;
@@ -15,17 +15,22 @@ export const MSG_PONG = 0x13;
 export const MSG_REKEY = 0x14;
 
 // Protocol size constants
-export const FRAME_HEADER_SIZE = 5; // [type:1][length:4 BE]
+export const FRAME_HEADER_SIZE = 5; // [type:1][length:4 BE] (always encrypted on the wire in v2)
 export const AEAD_TAG_SIZE = 16;
 export const NONCE_SIZE = 12;
 export const HANDSHAKE_NONCE_SIZE = 16;
+export const X25519_RAW_SIZE = 32;
 export const X25519_SPKI_SIZE = 44;
 export const ED25519_SPKI_SIZE = 44;
 export const ED25519_SIG_SIZE = 64;
 
-export const CLIENT_HELLO_SIZE = HANDSHAKE_NONCE_SIZE + X25519_SPKI_SIZE; // 60 min
+const X25519_SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
+const HANDSHAKE_OBF_SEED = crypto.createHash('sha256').update('socket-tunnel-v2/wire-obf-seed').digest();
+
+// Body sizes (excluding 16-byte wire salt and 5-byte encrypted frame header)
+export const CLIENT_HELLO_SIZE = X25519_RAW_SIZE; // 32 min (raw X25519 without ASN.1 OID)
 export const INNER_AUTH_SIZE = ED25519_SPKI_SIZE + ED25519_SIG_SIZE; // 108 min
-export const SERVER_HELLO_SIZE = HANDSHAKE_NONCE_SIZE + X25519_SPKI_SIZE + INNER_AUTH_SIZE + AEAD_TAG_SIZE; // 184 min
+export const SERVER_HELLO_SIZE = X25519_RAW_SIZE + INNER_AUTH_SIZE + AEAD_TAG_SIZE; // 156 min
 export const CLIENT_AUTH_SIZE = INNER_AUTH_SIZE + AEAD_TAG_SIZE; // 124 min
 export const SERVER_READY_SIZE = AEAD_TAG_SIZE; // 16 min
 export const MAX_HANDSHAKE_PAD = 256;
@@ -37,12 +42,12 @@ export const SERVER_READY_MAX_SIZE = SERVER_READY_SIZE + MAX_HANDSHAKE_PAD;
 
 export const MAX_PLAINTEXT_SIZE = 65536; // 64 KiB
 export const MAX_DATA_FRAME_SIZE = MAX_PLAINTEXT_SIZE + AEAD_TAG_SIZE; // 65552
-export const MAX_CONTROL_FRAME_SIZE = 64 + AEAD_TAG_SIZE;
+export const MAX_CONTROL_FRAME_SIZE = 128 + AEAD_TAG_SIZE;
 export const REKEY_FRAME_SIZE = 1 + AEAD_TAG_SIZE; // 17 bytes ([requestPeerUpdate:1] + GCM tag)
 const MAX_SEQ = 0xffff_ffff_ffff_fffen;
 
-const SERVER_SIG_CONTEXT = Buffer.from('socket-tunnel-v1/server-sig:', 'utf8');
-const CLIENT_SIG_CONTEXT = Buffer.from('socket-tunnel-v1/client-sig:', 'utf8');
+const SERVER_SIG_CONTEXT = Buffer.from('socket-tunnel-v2/server-sig:', 'utf8');
+const CLIENT_SIG_CONTEXT = Buffer.from('socket-tunnel-v2/client-sig:', 'utf8');
 
 export class ProtocolError extends Error {
   constructor(message, code = 'ERR_TUNNEL_PROTOCOL') {
@@ -202,12 +207,13 @@ export function loadAuthorizedKeys(filePathOrContent) {
   return parseAuthorizedKeys(content);
 }
 
-// --- Ephemeral ECDH (X25519) & Strict DER Imports ---
+// --- Ephemeral ECDH (X25519 Raw 32B Wire Format & Strict DER Imports) ---
 
 export function generateEphemeralKeys() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519');
   const publicKeyDer = publicKey.export({ type: 'spki', format: 'der' });
-  return { publicKey, privateKey, publicKeyDer };
+  const publicKeyRaw = Buffer.from(publicKeyDer.subarray(X25519_SPKI_PREFIX.length));
+  return { publicKey, privateKey, publicKeyDer, publicKeyRaw };
 }
 
 export function importX25519PublicKey(der) {
@@ -224,6 +230,14 @@ export function importX25519PublicKey(der) {
     throw new ProtocolError('Unexpected public key algorithm (expected x25519)', 'ERR_HANDSHAKE_KEY');
   }
   return key;
+}
+
+export function importX25519RawPublicKey(raw32) {
+  if (!Buffer.isBuffer(raw32) || raw32.length !== X25519_RAW_SIZE) {
+    throw new ProtocolError('Invalid raw X25519 key length', 'ERR_HANDSHAKE_KEY');
+  }
+  const der = Buffer.concat([X25519_SPKI_PREFIX, raw32], X25519_SPKI_SIZE);
+  return importX25519PublicKey(der);
 }
 
 export function importEd25519PublicKey(der) {
@@ -280,7 +294,7 @@ export function verifyClientTranscript(transcriptHash, clientSpkiDer, signature,
   }
 }
 
-// --- Transcript & Directional AEAD CipherState ---
+// --- Transcript, Handshake Wire Obfuscation & Directional AEAD + Header CipherState ---
 
 export class Transcript {
   constructor() {
@@ -304,33 +318,66 @@ function hkdfExpand(secret, salt, info, length) {
   return Buffer.from(crypto.hkdfSync('sha256', secret, salt, info, length));
 }
 
+function createHandshakeObfStream(salt16, label) {
+  const key = hkdfExpand(HANDSHAKE_OBF_SEED, salt16, `socket-tunnel-v2/obf/${label}/key`, 32);
+  const iv = hkdfExpand(HANDSHAKE_OBF_SEED, salt16, `socket-tunnel-v2/obf/${label}/iv`, 16);
+  return crypto.createCipheriv('aes-256-ctr', key, iv);
+}
+
+export function encodeSaltedHandshakeFrame(label, type, body, salt = crypto.randomBytes(HANDSHAKE_NONCE_SIZE)) {
+  const stream = createHandshakeObfStream(salt, label);
+  const plainHdr = Buffer.allocUnsafe(FRAME_HEADER_SIZE);
+  plainHdr[0] = type;
+  plainHdr.writeUInt32BE(body.length >>> 0, 1);
+  const encHdr = stream.update(plainHdr);
+  const encBody = stream.update(body);
+  return Buffer.concat([salt, encHdr, encBody], HANDSHAKE_NONCE_SIZE + FRAME_HEADER_SIZE + body.length);
+}
+
 export function deriveCipherPair(sharedSecret, transcriptHash, phase) {
-  const c2sKey = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v1/${phase}/c2s/key`, 32);
-  const c2sIv = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v1/${phase}/c2s/iv`, NONCE_SIZE);
-  const s2cKey = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v1/${phase}/s2c/key`, 32);
-  const s2cIv = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v1/${phase}/s2c/iv`, NONCE_SIZE);
+  const c2sKey = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v2/${phase}/c2s/key`, 32);
+  const c2sIv = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v2/${phase}/c2s/iv`, NONCE_SIZE);
+  const c2sHdrKey = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v2/${phase}/c2s/hdr-key`, 32);
+  const c2sHdrIv = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v2/${phase}/c2s/hdr-iv`, 16);
+
+  const s2cKey = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v2/${phase}/s2c/key`, 32);
+  const s2cIv = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v2/${phase}/s2c/iv`, NONCE_SIZE);
+  const s2cHdrKey = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v2/${phase}/s2c/hdr-key`, 32);
+  const s2cHdrIv = hkdfExpand(sharedSecret, transcriptHash, `socket-tunnel-v2/${phase}/s2c/hdr-iv`, 16);
 
   return {
-    c2s: new CipherState(c2sKey, c2sIv),
-    s2c: new CipherState(s2cKey, s2cIv),
+    c2s: new CipherState(c2sKey, c2sIv, c2sHdrKey, c2sHdrIv),
+    s2c: new CipherState(s2cKey, s2cIv, s2cHdrKey, s2cHdrIv),
   };
 }
 
 export class CipherState {
-  constructor(key, ivSalt) {
+  constructor(key, ivSalt, hdrKey = null, hdrIv = null) {
     this._key = key;
     this._ivSalt = ivSalt;
+    this._hdrKey = hdrKey || hkdfExpand(key, ivSalt, 'socket-tunnel-v2/default/hdr-key', 32);
+    this._hdrIv = hdrIv || hkdfExpand(key, ivSalt, 'socket-tunnel-v2/default/hdr-iv', 16);
+    this._hdrCipher = crypto.createCipheriv('aes-256-ctr', this._hdrKey, this._hdrIv);
     this._seq = 0n;
     this.epoch = 0;
   }
 
   ratchet() {
-    const nextKey = hkdfExpand(this._key, this._ivSalt, 'socket-tunnel-v1/rekey/key', 32);
-    const nextIv = hkdfExpand(this._key, this._ivSalt, 'socket-tunnel-v1/rekey/iv', NONCE_SIZE);
+    const nextKey = hkdfExpand(this._key, this._ivSalt, 'socket-tunnel-v2/rekey/key', 32);
+    const nextIv = hkdfExpand(this._key, this._ivSalt, 'socket-tunnel-v2/rekey/iv', NONCE_SIZE);
+    const nextHdrKey = hkdfExpand(this._hdrKey, this._ivSalt, 'socket-tunnel-v2/rekey/hdr-key', 32);
+    const nextHdrIv = hkdfExpand(this._hdrKey, this._ivSalt, 'socket-tunnel-v2/rekey/hdr-iv', 16);
+
     this._key.fill(0);
     this._ivSalt.fill(0);
+    this._hdrKey.fill(0);
+    this._hdrIv.fill(0);
+
     this._key = nextKey;
     this._ivSalt = nextIv;
+    this._hdrKey = nextHdrKey;
+    this._hdrIv = nextHdrIv;
+    this._hdrCipher = crypto.createCipheriv('aes-256-ctr', this._hdrKey, this._hdrIv);
     this._seq = 0n;
     this.epoch++;
   }
@@ -349,12 +396,27 @@ export class CipherState {
       nonce[4 + i] ^= seqBuf[i];
     }
 
-    // Bind both frameType and sequence number into GCM AAD
+    // Bind both frameType and sequence number into GCM AAD (authenticates decrypted header!)
     const aad = Buffer.allocUnsafe(9);
     aad[0] = frameType;
     seqBuf.copy(aad, 1);
 
     return { nonce, aad };
+  }
+
+  encryptHeader(frameType, payloadLength) {
+    const plainHdr = Buffer.allocUnsafe(FRAME_HEADER_SIZE);
+    plainHdr[0] = frameType;
+    plainHdr.writeUInt32BE(payloadLength >>> 0, 1);
+    return this._hdrCipher.update(plainHdr);
+  }
+
+  decryptHeader(encHdr5) {
+    const plainHdr = this._hdrCipher.update(encHdr5);
+    return {
+      type: plainHdr[0],
+      len: plainHdr.readUInt32BE(1),
+    };
   }
 
   encrypt(frameType, plaintext) {
@@ -365,6 +427,12 @@ export class CipherState {
     const enc2 = cipher.final();
     const tag = cipher.getAuthTag();
     return Buffer.concat([enc1, enc2, tag], enc1.length + enc2.length + AEAD_TAG_SIZE);
+  }
+
+  encryptFrame(frameType, plaintext) {
+    const payload = this.encrypt(frameType, plaintext);
+    const encHdr = this.encryptHeader(frameType, payload.length);
+    return Buffer.concat([encHdr, payload], FRAME_HEADER_SIZE + payload.length);
   }
 
   decrypt(frameType, payload) {
@@ -390,10 +458,12 @@ export class CipherState {
   destroy() {
     this._key.fill(0);
     this._ivSalt.fill(0);
+    this._hdrKey.fill(0);
+    this._hdrIv.fill(0);
   }
 }
 
-// --- Wire Framing & O(N) Bounded FrameParser ---
+// --- Wire Framing & O(N) Bounded Encrypted-Header FrameParser ---
 
 export function encodeFrame(type, payload) {
   const frame = Buffer.allocUnsafe(FRAME_HEADER_SIZE + payload.length);
@@ -419,34 +489,30 @@ export function defaultMaxFrameSize(type) {
 }
 
 export class FrameParser {
-  constructor(onFrame, getMaxPayloadSize = defaultMaxFrameSize) {
+  constructor(onFrame, getMaxPayloadSize = defaultMaxFrameSize, initialMode = 'plain') {
     this._chunks = [];
     this._totalLength = 0;
     this._onFrame = onFrame;
     this._getMaxPayloadSize = getMaxPayloadSize;
     this._stopped = false;
-    this._headerScratch = Buffer.allocUnsafe(FRAME_HEADER_SIZE);
+
+    // Modes: 'plain' | 'salted-ch' | 'salted-sh' | 'cipher'
+    this._mode = initialMode;
+    this._cipher = null;
+    this._pendingFrame = null; // { type, len, salt, bodyStream }
+  }
+
+  setCipher(cipherState) {
+    this._mode = 'cipher';
+    this._cipher = cipherState;
   }
 
   stop() {
     this._stopped = true;
     this._chunks.length = 0;
     this._totalLength = 0;
-  }
-
-  _peekHeader() {
-    const first = this._chunks[0];
-    if (first.length >= FRAME_HEADER_SIZE) {
-      return first;
-    }
-    let copied = 0;
-    for (const chunk of this._chunks) {
-      const toCopy = Math.min(chunk.length, FRAME_HEADER_SIZE - copied);
-      chunk.copy(this._headerScratch, copied, 0, toCopy);
-      copied += toCopy;
-      if (copied === FRAME_HEADER_SIZE) break;
-    }
-    return this._headerScratch;
+    this._pendingFrame = null;
+    this._cipher = null;
   }
 
   _consumeBytes(count, targetBuffer = null) {
@@ -474,31 +540,71 @@ export class FrameParser {
     this._chunks.push(chunk);
     this._totalLength += chunk.length;
 
-    while (!this._stopped && this._totalLength >= FRAME_HEADER_SIZE) {
-      const header = this._peekHeader();
-      const type = header[0];
-      const len = header.readUInt32BE(1);
-      const maxLen = this._getMaxPayloadSize(type);
+    while (!this._stopped) {
+      if (!this._pendingFrame) {
+        const isSalted = this._mode === 'salted-ch' || this._mode === 'salted-sh';
+        const neededHdr = isSalted ? (HANDSHAKE_NONCE_SIZE + FRAME_HEADER_SIZE) : FRAME_HEADER_SIZE;
+        if (this._totalLength < neededHdr) {
+          return;
+        }
 
-      if (maxLen < 0) {
-        this.stop();
-        throw new ProtocolError(`Unknown frame type: 0x${type.toString(16)}`, 'ERR_UNKNOWN_FRAME');
+        let type;
+        let len;
+        let salt = null;
+        let bodyStream = null;
+
+        if (isSalted) {
+          salt = Buffer.allocUnsafe(HANDSHAKE_NONCE_SIZE);
+          const encHdr = Buffer.allocUnsafe(FRAME_HEADER_SIZE);
+          this._consumeBytes(HANDSHAKE_NONCE_SIZE, salt);
+          this._consumeBytes(FRAME_HEADER_SIZE, encHdr);
+
+          const label = this._mode === 'salted-ch' ? 'ch' : 'sh';
+          bodyStream = createHandshakeObfStream(salt, label);
+          const plainHdr = bodyStream.update(encHdr);
+          type = plainHdr[0];
+          len = plainHdr.readUInt32BE(1);
+        } else if (this._mode === 'cipher') {
+          const encHdr = Buffer.allocUnsafe(FRAME_HEADER_SIZE);
+          this._consumeBytes(FRAME_HEADER_SIZE, encHdr);
+          ({ type, len } = this._cipher.decryptHeader(encHdr));
+        } else {
+          const plainHdr = Buffer.allocUnsafe(FRAME_HEADER_SIZE);
+          this._consumeBytes(FRAME_HEADER_SIZE, plainHdr);
+          type = plainHdr[0];
+          len = plainHdr.readUInt32BE(1);
+        }
+
+        const maxLen = this._getMaxPayloadSize(type);
+        if (maxLen < 0) {
+          this.stop();
+          throw new ProtocolError(`Unknown frame type: 0x${type.toString(16)}`, 'ERR_UNKNOWN_FRAME');
+        }
+        if (len > maxLen) {
+          this.stop();
+          throw new ProtocolError(`Frame length ${len} exceeds limit ${maxLen} for type 0x${type.toString(16)}`, 'ERR_FRAME_TOO_LARGE');
+        }
+
+        this._pendingFrame = { type, len, salt, bodyStream };
       }
-      if (len > maxLen) {
-        this.stop();
-        throw new ProtocolError(`Frame length ${len} exceeds limit ${maxLen} for type 0x${type.toString(16)}`, 'ERR_FRAME_TOO_LARGE');
-      }
-      if (this._totalLength < FRAME_HEADER_SIZE + len) {
+
+      const pending = this._pendingFrame;
+      if (this._totalLength < pending.len) {
         return;
       }
 
-      this._consumeBytes(FRAME_HEADER_SIZE, null);
-      const payload = Buffer.allocUnsafe(len);
-      if (len > 0) {
-        this._consumeBytes(len, payload);
+      const rawBody = Buffer.allocUnsafe(pending.len);
+      if (pending.len > 0) {
+        this._consumeBytes(pending.len, rawBody);
       }
+      this._pendingFrame = null;
 
-      this._onFrame(type, payload);
+      if (pending.bodyStream) {
+        const decBody = pending.len > 0 ? pending.bodyStream.update(rawBody) : rawBody;
+        this._onFrame(pending.type, decBody, pending.salt);
+      } else {
+        this._onFrame(pending.type, rawBody, null);
+      }
     }
   }
 }

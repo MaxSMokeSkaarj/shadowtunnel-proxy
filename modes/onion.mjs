@@ -122,6 +122,8 @@ export async function handleOnionRelay({ request, leftover, inTunnel, connectTim
       return;
     }
 
+    // Disable intermediate relay keepalive once extended into blind pipe (prevents hop-count echo oracle!)
+    inTunnel.setKeepAlive?.(0);
     sendControlOk(inTunnel);
     if (leftover.length > 0) nextSock.write(leftover);
     inTunnel.resume();
